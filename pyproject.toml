@@ -1,0 +1,36 @@
+[project]
+name = "mark-xxxix"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "comtypes>=1.4.16 ; sys_platform == 'win32'",
+    "duckduckgo-search>=8.1.1",
+    "google-genai>=2.4.0",
+    "google-generativeai>=0.8.6",
+    "mss>=10.2.0",
+    "numpy>=2.4.5",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "playwright>=1.60.0",
+    "psutil>=7.2.2",
+    "pyautogui>=0.9.54",
+    "pycaw>=20251023 ; sys_platform == 'win32'",
+    "pygetwindow>=0.0.9",
+    "pyperclip>=1.11.0",
+    "pyqt6>=6.11.0",
+    "python-pptx>=1.0.2",
+    "pywinauto>=0.6.9 ; sys_platform == 'win32'",
+    "requests>=2.34.2",
+    "send2trash>=2.1.0",
+    "sounddevice>=0.5.5",
+    "win10toast>=0.9 ; sys_platform == 'win32'",
+    "youtube-transcript-api>=1.2.4",
+]
+
+[tool.uv]
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'"
+]
