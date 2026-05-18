@@ -41,7 +41,7 @@ It's not just an assistant — it's an extension of your digital life.
 
 ```bash
 git clone https://github.com/Slayers-001/A.I.git
-cd Mark-XXXIX
+cd A.I
 pip install -r requirements.txt
 playwright install
 python main.py
