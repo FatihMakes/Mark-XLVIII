@@ -5,20 +5,19 @@ pillow
 requests
 beautifulsoup4
 duckduckgo-search
-playwright          
+playwright
 pyautogui
 pyperclip
-pygetwindow       
+pygetwindow
 opencv-python
 numpy
 mss
-Pillow
 psutil
-comtypes
-pycaw               
-win10toast          
+comtypes; sys_platform == "win32"
+pycaw; sys_platform == "win32"
+win10toast; sys_platform == "win32"
 send2trash
 youtube-transcript-api
-pywinauto
+pywinauto; sys_platform == "win32"
 python-pptx
 pyqt6

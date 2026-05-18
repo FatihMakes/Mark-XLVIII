@@ -1,0 +1,6 @@
+actions/
+__pycache__/
+config/api_keys.json
+memory/long_term.json
+memory/
+config/
