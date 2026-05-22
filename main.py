@@ -718,6 +718,22 @@ class JarvisLive:
                     {"data": data, "mime_type": "audio/pcm"}
                 )
 
+        # Проверяем, есть ли вообще микрофон в системе
+        mic_available = False
+        try:
+            # query_devices с kind='input' бросит ошибку или вернет пустой/невалидный девайс, если их нет
+            sd.query_devices(kind='input')
+            mic_available = True
+        except Exception as e:
+            print(f"[JARVIS] ⚠️ No input devices (microphone) found: {e}")
+
+        if not mic_available:
+            print("[JARVIS] 🔇 Running in silent mode (no microphone input available).")
+            # Оставляем таск жить, чтобы TaskGroup не падал из-за отмены или завершения
+            while True:
+                await asyncio.sleep(3600)
+
+
         try:
             with sd.InputStream(
                 samplerate=SEND_SAMPLE_RATE,
