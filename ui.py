@@ -1313,8 +1313,10 @@ class SetupOverlay(QWidget):
 # ──────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    _log_sig   = pyqtSignal(str)
-    _state_sig = pyqtSignal(str)
+    _log_sig      = pyqtSignal(str)
+    _state_sig    = pyqtSignal(str)
+    _cam_open_sig = pyqtSignal(object)   # carries player; opens camera window
+    _cam_close_sig = pyqtSignal()        # closes camera window
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1390,6 +1392,8 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._cam_open_sig.connect(self._do_open_camera)
+        self._cam_close_sig.connect(self._do_close_camera)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -1400,6 +1404,15 @@ class MainWindow(QMainWindow):
         sc_mute.activated.connect(self._toggle_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
+
+    # Camera window — always called in the main thread via queued signal
+    def _do_open_camera(self, player):
+        from actions.camera_control import _open_win
+        _open_win(player)
+
+    def _do_close_camera(self):
+        from actions.camera_control import _close_win
+        _close_win()
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1963,3 +1976,10 @@ class JarvisUI:
     def stop_speaking(self):
         if not self.muted:
             self.set_state("LISTENING")
+
+    def open_camera(self, player=None):
+        """Thread-safe: emits a queued signal so the window is created in the main thread."""
+        self._win._cam_open_sig.emit(player or self)
+
+    def close_camera(self):
+        self._win._cam_close_sig.emit()

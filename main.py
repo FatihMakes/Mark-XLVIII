@@ -3,6 +3,7 @@ import re
 import threading
 import json
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.camera_control    import camera_control
 
 
 def get_base_dir():
@@ -353,6 +355,25 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "camera_control",
+        "description": (
+            "Opens or closes the system camera. "
+            "Call this whenever the user says: 'turn on the camera', 'open camera', "
+            "'show me the camera', 'turn off the camera', 'close camera'. "
+            "On macOS opens Photo Booth. On Windows opens the Camera app."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "open (default) | close"
+                }
+            },
+            "required": []
+        }
+    },
+    {
         "name": "flight_finder",
         "description": "Searches Google Flights and speaks the best options.",
         "parameters": {
@@ -490,6 +511,10 @@ class JarvisLive:
         self._loop          = None
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
+        # Timestamp when Jarvis last finished speaking — used for echo cooldown
+        self._speaking_ended_at: float = 0.0
+        # Seconds to suppress mic input after Jarvis stops talking
+        self._echo_cooldown: float = 0.65
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
 
@@ -507,6 +532,9 @@ class JarvisLive:
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
+            if not value:
+                # Record when speaking ended so the mic cooldown can kick in
+                self._speaking_ended_at = time.time()
         if value:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
@@ -669,6 +697,10 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: game_updater(parameters=args, player=self.ui, speak=self.speak))
                 result = r or "Done."
 
+            elif name == "camera_control":
+                r = await loop.run_in_executor(None, lambda: camera_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
@@ -710,8 +742,14 @@ class JarvisLive:
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
+                jarvis_speaking    = self._is_speaking
+                last_ended         = self._speaking_ended_at
+            # Suppress mic while Jarvis is speaking AND for a brief cooldown
+            # after it stops, so the speaker bleed doesn't echo back.
+            in_cooldown = (not jarvis_speaking) and (
+                time.time() - last_ended < self._echo_cooldown
+            )
+            if not jarvis_speaking and not in_cooldown and not self.ui.muted:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
