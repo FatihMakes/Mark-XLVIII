@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -152,7 +153,7 @@ def _detect_camera_index() -> int:
 
     backend = _cv2_backend()
     print("[Vision] 🔍 Auto-detecting camera...")
-    for idx in range(6):
+    for idx in range(10):
         if _probe_camera(idx, backend):
             print(f"[Vision] ✅ Camera found at index {idx}")
             _save_config_key("camera_index", idx)
@@ -165,6 +166,9 @@ def _detect_camera_index() -> int:
 
 
 def _get_camera_index() -> int:
+    env_idx = os.environ.get("JARVIS_CAMERA_INDEX", "").strip()
+    if env_idx.isdigit():
+        return int(env_idx)
     cfg = _load_config()
     if "camera_index" in cfg:
         return int(cfg["camera_index"])

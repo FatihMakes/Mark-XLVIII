@@ -20,6 +20,21 @@ from playwright.async_api import (
 )
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
 
+def _first_usable_page(context: BrowserContext) -> Optional[Page]:
+    """Persistent browser profiles often already have a tab — avoid extra new_page()."""
+    for page in context.pages:
+        if page and not page.is_closed():
+            return page
+    return None
+
+
+async def _open_page(context: BrowserContext) -> Page:
+    existing = _first_usable_page(context)
+    if existing is not None:
+        return existing
+    return await context.new_page()
+
+
 def _normalize_url(url: str) -> str:
     """
     Bare words like "instagram" → "https://instagram.com"
@@ -444,8 +459,8 @@ class _BrowserSession:
                 Path(jarvis).mkdir(parents=True, exist_ok=True)
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
 
-            await asyncio.sleep(0.5)  
-            self._page = await self._context.new_page()
+            await asyncio.sleep(0.5)
+            self._page = await _open_page(self._context)
             print(f"[Browser] ✅ Firefox launched")
             return
 
@@ -460,7 +475,7 @@ class _BrowserSession:
             }
             self._context = await engine_obj.launch_persistent_context(safari_profile, **kwargs)
             await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
+            self._page = await _open_page(self._context)
             print(f"[Browser] ✅ Safari launched")
             return
 
@@ -493,8 +508,8 @@ class _BrowserSession:
 
         try:
             self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
-            await asyncio.sleep(0.5) 
-            self._page = await self._context.new_page()
+            await asyncio.sleep(0.5)
+            self._page = await _open_page(self._context)
             print(f"[Browser] ✅ Launched [{label}] profile={profile}")
             return
         except Exception as e:
@@ -507,7 +522,7 @@ class _BrowserSession:
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
             await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
+            self._page = await _open_page(self._context)
             print(f"[Browser] ✅ Launched [{label}] with JARVIS profile")
         except Exception as e2:
             raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
@@ -517,7 +532,7 @@ class _BrowserSession:
         await self._launch()
         # If somehow page got closed, open a fresh one
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            self._page = await _open_page(self._context)
             await asyncio.sleep(0.2)
         return self._page
 
