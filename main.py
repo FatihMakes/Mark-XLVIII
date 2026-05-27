@@ -47,6 +47,7 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+EXIT_CONFIRMATIONS_REQUIRED = 3
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -373,8 +374,9 @@ TOOL_DECLARATIONS = [
         "name": "shutdown_jarvis",
         "description": (
             "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
+            "Call this only when the user explicitly gives an exit, quit, close, "
+            "or stop-running command for Jarvis. The assistant will keep running "
+            "until this tool has been requested three consecutive times. "
             "The user can say this in ANY language."
         ),
         "parameters": {
@@ -490,6 +492,7 @@ class JarvisLive:
         self._loop          = None
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
+        self._exit_request_count = 0
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
 
@@ -570,6 +573,9 @@ class JarvisLive:
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
+
+        if name != "shutdown_jarvis":
+            self._exit_request_count = 0
 
         if name == "save_memory":
             category = args.get("category", "notes")
@@ -674,13 +680,28 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                self.speak("Goodbye, sir.")
-                def _shutdown():
-                    import time, os
-                    time.sleep(1)
-                    os._exit(0)
-                threading.Thread(target=_shutdown, daemon=True).start()
+                self._exit_request_count += 1
+                remaining = EXIT_CONFIRMATIONS_REQUIRED - self._exit_request_count
+                self.ui.write_log(
+                    f"SYS: Shutdown requested ({self._exit_request_count}/{EXIT_CONFIRMATIONS_REQUIRED})."
+                )
+                if remaining > 0:
+                    self.speak(
+                        f"Exit request noted, sir. Repeat the exit command {remaining} more time"
+                        f"{'s' if remaining != 1 else ''} to shut me down."
+                    )
+                    result = (
+                        f"Shutdown confirmation {self._exit_request_count}/"
+                        f"{EXIT_CONFIRMATIONS_REQUIRED}. Assistant remains running."
+                    )
+                else:
+                    self.speak("Goodbye, sir.")
+                    def _shutdown():
+                        import time, os
+                        time.sleep(1)
+                        os._exit(0)
+                    threading.Thread(target=_shutdown, daemon=True).start()
+                    result = "Shutdown confirmed. Assistant is exiting."
 
             else:
                 result = f"Unknown tool: {name}"
