@@ -107,5 +107,6 @@ venv.bak/
 *.log
 
 config/api_keys.json
+memory/
 
 .idea/
