@@ -11,6 +11,8 @@ pyperclip
 pygetwindow       
 opencv-python
 numpy
+openwakeword
+onnxruntime
 mss
 Pillow
 psutil
