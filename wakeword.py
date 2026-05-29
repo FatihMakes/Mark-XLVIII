@@ -42,9 +42,10 @@ class WakeWordDetector:
         threshold: float = THRESHOLD,
         debounce_seconds: float = DEBOUNCE_SECONDS,
         frame_samples: int = FRAME_SAMPLES,
+        custom_model: str | Path = CUSTOM_MODEL,
         model: Model | None = None,
     ):
-        self.model = model or build_model()
+        self.model = model or build_model(custom_model)
         self.threshold = threshold
         self.debounce_seconds = debounce_seconds
         self.frame_samples = frame_samples

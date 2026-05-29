@@ -1450,8 +1450,13 @@ class MainWindow(QMainWindow):
 class _RootShim:
     def __init__(self, app: QApplication):
         self._app = app
+        self._signal_timer = QTimer()
+        self._signal_timer.timeout.connect(lambda: None)
+        self._signal_timer.start(100)
     def mainloop(self):
         self._app.exec()
+    def quit(self):
+        self._app.quit()
     def protocol(self, *_):
         pass
 

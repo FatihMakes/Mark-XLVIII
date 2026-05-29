@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import re
+import signal
 import threading
 import json
 import sys
@@ -43,12 +44,39 @@ def get_base_dir():
 
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+APP_CONFIG_PATH = BASE_DIR / "config" / "app_config.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+DEFAULT_CONVERSATION_IDLE_SLEEP_SECONDS = 60
+DEFAULT_WAKE_WORD_MODEL = "nee_how__ahh_niu.onnx"
+
+def _load_app_config() -> dict:
+    config = {
+        "conversation_idle_sleep_seconds": DEFAULT_CONVERSATION_IDLE_SLEEP_SECONDS,
+        "wake_word_model": DEFAULT_WAKE_WORD_MODEL,
+    }
+    try:
+        with open(APP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return config
+    except Exception as e:
+        print(f"[JARVIS] Failed to load app config: {e}")
+        return config
+
+    if isinstance(data, dict):
+        config.update({k: v for k, v in data.items() if k in config})
+    return config
+
+def _resolve_path(value: str | Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return BASE_DIR / path
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -495,26 +523,114 @@ class JarvisLive:
         self._wake_detector = None
         self._wake_event: asyncio.Event | None = None
         self._sleep_event: asyncio.Event | None = None
+        self._shutdown_event: asyncio.Event | None = None
         self._conversation_active = False
         self._conversation_starting = False
         self._startup_audio_buffer = []
+        self._pending_text_commands: list[str] = []
+        self._pending_text_lock = threading.Lock()
+        self._app_config = _load_app_config()
+        self._conversation_idle_sleep_seconds = self._read_idle_sleep_seconds()
+        self._wake_word_model_path = _resolve_path(
+            str(self._app_config.get("wake_word_model") or DEFAULT_WAKE_WORD_MODEL)
+        )
+        self._last_conversation_activity = 0.0
         self._sleep_after_turn = False
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
 
-    def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
-            self.ui.write_log("SYS: JARVIS is sleeping. Say the wake word to start a conversation.")
+    def request_shutdown(self):
+        if not self._loop:
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
+
+        def _set_shutdown():
+            if self._shutdown_event:
+                self._shutdown_event.set()
+            if self._sleep_event:
+                self._sleep_event.set()
+            if self._wake_event:
+                self._wake_event.set()
+
+        self._loop.call_soon_threadsafe(_set_shutdown)
+
+    def _read_idle_sleep_seconds(self) -> float:
+        value = self._app_config.get("conversation_idle_sleep_seconds")
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return float(DEFAULT_CONVERSATION_IDLE_SLEEP_SECONDS)
+        return max(0.0, seconds)
+
+    def _mark_conversation_activity(self):
+        self._last_conversation_activity = asyncio.get_running_loop().time()
+
+    async def _watch_conversation_idle(self):
+        timeout = self._conversation_idle_sleep_seconds
+        if timeout <= 0:
+            return
+
+        while True:
+            elapsed = asyncio.get_running_loop().time() - self._last_conversation_activity
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                self.ui.write_log("SYS: No conversation activity. Returning to sleep mode.")
+                if self._sleep_event:
+                    self._sleep_event.set()
+                return
+            await asyncio.sleep(min(remaining, 1.0))
+
+    def _on_text_command(self, text: str):
+        text = text.strip()
+        if not text:
+            return
+
+        if not self._loop:
+            self._queue_text_command(text)
+            return
+
+        def _handle_text_command():
+            if self.session and self._conversation_active:
+                asyncio.create_task(self._send_text_command(text))
+                return
+
+            self._queue_text_command(text)
+            if self._conversation_starting:
+                self.ui.write_log("SYS: Text command queued while JARVIS wakes.")
+                return
+
+            self._conversation_starting = True
+            self.ui.set_state("THINKING")
+            self.ui.write_log("SYS: Text command received. Waking JARVIS.")
+            if self._wake_event and not self._wake_event.is_set():
+                self._wake_event.set()
+
+        self._loop.call_soon_threadsafe(_handle_text_command)
+
+    def _queue_text_command(self, text: str):
+        with self._pending_text_lock:
+            self._pending_text_commands.append(text)
+
+    def _pop_pending_text_commands(self) -> list[str]:
+        with self._pending_text_lock:
+            commands = self._pending_text_commands
+            self._pending_text_commands = []
+        return commands
+
+    async def _send_text_command(self, text: str):
+        if not self.session:
+            self._queue_text_command(text)
+            return
+        self._mark_conversation_activity()
+        await self.session.send_client_content(
+            turns={"parts": [{"text": text}]},
+            turn_complete=True
         )
+
+    async def _flush_pending_text_commands(self):
+        for text in self._pop_pending_text_commands():
+            await self._send_text_command(text)
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -739,7 +855,7 @@ class JarvisLive:
 
     async def _wait_for_wakeword(self):
         print("[JARVIS] 💤 Wake word detector started")
-        self._wake_detector = WakeWordDetector()
+        self._wake_detector = WakeWordDetector(custom_model=self._wake_word_model_path)
 
         while True:
             data = await self._wake_audio_queue.get()
@@ -809,8 +925,10 @@ class JarvisLive:
         try:
             while True:
                 async for response in self.session.receive():
+                    activity_seen = False
 
                     if response.data:
+                        activity_seen = True
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
                         self.audio_in_queue.put_nowait(response.data)
@@ -821,11 +939,13 @@ class JarvisLive:
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt:
+                                activity_seen = True
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
+                                activity_seen = True
                                 in_buf.append(txt)
 
                         if sc.turn_complete:
@@ -847,6 +967,7 @@ class JarvisLive:
                                     self._sleep_event.set()
 
                     if response.tool_call:
+                        activity_seen = True
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
@@ -855,6 +976,9 @@ class JarvisLive:
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
+
+                    if activity_seen:
+                        self._mark_conversation_activity()
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
@@ -916,6 +1040,7 @@ class JarvisLive:
                 self._sleep_after_turn = False
                 self._conversation_active = True
                 self._conversation_starting = False
+                self._mark_conversation_activity()
 
                 print("[JARVIS] ✅ Connected.")
                 self.ui.set_state("LISTENING")
@@ -930,14 +1055,20 @@ class JarvisLive:
                     asyncio.create_task(self._receive_audio()),
                     asyncio.create_task(self._play_audio()),
                 ]
+                if self._conversation_idle_sleep_seconds > 0:
+                    tasks.append(asyncio.create_task(self._watch_conversation_idle()))
+
+                await self._flush_pending_text_commands()
 
                 sleep_task = asyncio.create_task(self._sleep_event.wait())
+                shutdown_task = asyncio.create_task(self._shutdown_event.wait())
                 tasks.append(sleep_task)
+                tasks.append(shutdown_task)
 
                 try:
                     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                     for task in done:
-                        if task is sleep_task:
+                        if task in (sleep_task, shutdown_task):
                             continue
                         exc = task.exception()
                         if exc:
@@ -962,6 +1093,7 @@ class JarvisLive:
         self._loop = asyncio.get_event_loop()
         self._wake_audio_queue = asyncio.Queue(maxsize=50)
         self._wake_event = asyncio.Event()
+        self._shutdown_event = asyncio.Event()
 
         client = genai.Client(
             api_key=_get_api_key(),
@@ -976,7 +1108,19 @@ class JarvisLive:
 
         try:
             while True:
-                await self._wake_event.wait()
+                wake_wait = asyncio.create_task(self._wake_event.wait())
+                shutdown_wait = asyncio.create_task(self._shutdown_event.wait())
+                done, pending = await asyncio.wait(
+                    (wake_wait, shutdown_wait),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                if shutdown_wait in done:
+                    break
+
                 self._wake_event.clear()
 
                 try:
@@ -992,20 +1136,41 @@ class JarvisLive:
             mic_task.cancel()
             wake_task.cancel()
             await asyncio.gather(mic_task, wake_task, return_exceptions=True)
+            self._shutdown_event = None
 
 def main():
     ui = JarvisUI("face.png")
+    jarvis_ref = {"instance": None}
+    shutdown_requested = False
+
+    def shutdown(signum=None, frame=None):
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        print("\n[JARVIS] Shutting down...")
+        jarvis = jarvis_ref.get("instance")
+        if jarvis:
+            jarvis.request_shutdown()
+        ui.root.quit()
 
     def runner():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
-        try:
-            asyncio.run(jarvis.run())
-        except KeyboardInterrupt:
-            print("\n🔴 Shutting down...")
+        jarvis_ref["instance"] = jarvis
+        asyncio.run(jarvis.run())
 
-    threading.Thread(target=runner, daemon=True).start()
-    ui.root.mainloop()
+    signal.signal(signal.SIGINT, shutdown)
+
+    worker = threading.Thread(target=runner, daemon=True)
+    worker.start()
+    try:
+        ui.root.mainloop()
+    except KeyboardInterrupt:
+        shutdown()
+    finally:
+        shutdown()
+        worker.join(timeout=2)
 
 if __name__ == "__main__":
     main()

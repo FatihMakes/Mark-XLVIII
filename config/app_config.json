@@ -1,0 +1,4 @@
+{
+  "conversation_idle_sleep_seconds": 60,
+  "wake_word_model": "nee_how__ahh_niu.onnx"
+}
