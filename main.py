@@ -1,6 +1,7 @@
 import asyncio
 import array
 import contextlib
+import math
 import re
 import signal
 import threading
@@ -55,6 +56,10 @@ CHUNK_SIZE          = 1024
 DEFAULT_CONVERSATION_IDLE_SLEEP_SECONDS = 60
 DEFAULT_WAKE_WORD_MODEL = "nee_how__ahh_niu.onnx"
 OUTPUT_SILENCE_RMS_THRESHOLD = 200
+READY_CHIME_SAMPLE_RATE = 24000
+READY_CHIME_DURATION_SECONDS = 0.18
+READY_CHIME_FREQUENCY_HZ = 880
+READY_CHIME_VOLUME = 0.22
 
 def _load_app_config() -> dict:
     config = {
@@ -673,6 +678,43 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
+    def _play_ready_chime_sync(self):
+        sample_count = int(READY_CHIME_SAMPLE_RATE * READY_CHIME_DURATION_SECONDS)
+        amplitude = int(32767 * READY_CHIME_VOLUME)
+        samples = array.array("h")
+        fade_samples = max(1, int(READY_CHIME_SAMPLE_RATE * 0.025))
+
+        for i in range(sample_count):
+            envelope = 1.0
+            if i < fade_samples:
+                envelope = i / fade_samples
+            elif sample_count - i < fade_samples:
+                envelope = (sample_count - i) / fade_samples
+
+            value = int(
+                amplitude
+                * envelope
+                * math.sin(2 * math.pi * READY_CHIME_FREQUENCY_HZ * i / READY_CHIME_SAMPLE_RATE)
+            )
+            samples.append(value)
+
+        with sd.RawOutputStream(
+            samplerate=READY_CHIME_SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="int16",
+            blocksize=CHUNK_SIZE,
+        ) as stream:
+            stream.write(samples.tobytes())
+
+    async def _play_ready_chime(self):
+        self.set_speaking(True)
+        try:
+            await asyncio.to_thread(self._play_ready_chime_sync)
+        except Exception as e:
+            print(f"[JARVIS] Ready chime failed: {e}")
+        finally:
+            self.set_speaking(False)
+
     def _enqueue_wake_audio(self, data: bytes):
         if not self._wake_audio_queue:
             return
@@ -1086,6 +1128,7 @@ class JarvisLive:
                 self._mark_conversation_activity()
 
                 print("[JARVIS] ✅ Connected.")
+                await self._play_ready_chime()
                 self.ui.set_state("LISTENING")
                 self.ui.write_log("SYS: JARVIS awake. Conversation started.")
 
