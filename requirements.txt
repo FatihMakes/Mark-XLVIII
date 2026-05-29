@@ -24,3 +24,4 @@ youtube-transcript-api
 pywinauto
 python-pptx
 pyqt6
+pygame

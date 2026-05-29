@@ -36,6 +36,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.music_player      import music_player
 
 
 def get_base_dir():
@@ -206,6 +207,37 @@ TOOL_DECLARATIONS = [
                 "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
                 "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
                 "url":    {"type": "STRING", "description": "Video URL for get_info action"},
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "music_player",
+        "description": (
+            "Searches online music by keyword, downloads the selected song, plays it locally, "
+            "and controls music playback. Use for ALL music/song requests: play music, search songs, "
+            "pause music, resume music, stop music, toggle playback, seek within a song, get lyrics, "
+            "or check music status. Do NOT use youtube_video, web_search, or open_app for music playback."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "search_play | search | play | pause | resume | toggle | stop | seek | lyrics | status (default: search_play)"
+                },
+                "query": {
+                    "type": "STRING",
+                    "description": "Song/music keyword, song name, artist, or search phrase"
+                },
+                "choice": {
+                    "type": "INTEGER",
+                    "description": "Selected search result index, starting at 1 (default: 1)"
+                },
+                "position_seconds": {
+                    "type": "NUMBER",
+                    "description": "Target playback position in seconds for seek"
+                },
             },
             "required": []
         }
@@ -560,6 +592,7 @@ class JarvisLive:
         self._sleep_after_turn = False
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
+        self._tool_running = False
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
 
@@ -848,6 +881,10 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui))
                 result = r or "Done."
 
+            elif name == "music_player":
+                r = await loop.run_in_executor(None, lambda: music_player(parameters=args, response=None, player=self.ui))
+                result = {"status": "ok", "result": r or "Done.", "silent": True}
+
             elif name == "screen_process":
                 threading.Thread(
                     target=screen_process,
@@ -922,9 +959,10 @@ class JarvisLive:
             self.ui.set_state("LISTENING" if self._conversation_active else "SLEEPING")
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        response = result if isinstance(result, dict) else {"result": result}
         return types.FunctionResponse(
             id=fc.id, name=name,
-            response={"result": result}
+            response=response
         )
 
     async def _send_realtime(self):
@@ -974,6 +1012,7 @@ class JarvisLive:
             if (
                 self._conversation_active
                 and not jarvis_speaking
+                and not self._tool_running
                 and not self.ui.muted
                 and self.out_queue is not None
             ):
@@ -1049,13 +1088,17 @@ class JarvisLive:
                     if response.tool_call:
                         activity_seen = True
                         fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
+                        self._tool_running = True
+                        try:
+                            for fc in response.tool_call.function_calls:
+                                print(f"[JARVIS] 📞 {fc.name}")
+                                fr = await self._execute_tool(fc)
+                                fn_responses.append(fr)
+                            await self.session.send_tool_response(
+                                function_responses=fn_responses
+                            )
+                        finally:
+                            self._tool_running = False
 
                     if activity_seen:
                         self._mark_conversation_activity()
