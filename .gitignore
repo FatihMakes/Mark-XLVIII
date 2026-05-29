@@ -106,7 +106,8 @@ venv.bak/
 .DS_Store
 *.log
 
+.idea/
+
 config/api_keys.json
 memory/
-
-.idea/
+temp/*.*
