@@ -1014,6 +1014,7 @@ class JarvisLive:
                             self._sleep_event.set()
                     continue
                 self.set_speaking(True)
+                self._mark_conversation_activity()
                 await asyncio.to_thread(stream.write, chunk)
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
