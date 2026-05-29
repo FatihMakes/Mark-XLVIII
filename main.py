@@ -682,6 +682,26 @@ class JarvisLive:
         with contextlib.suppress(asyncio.QueueFull):
             self._wake_audio_queue.put_nowait(data)
 
+    def _drain_wake_audio_queue(self) -> int:
+        if not self._wake_audio_queue:
+            return 0
+
+        drained = 0
+        while True:
+            try:
+                self._wake_audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return drained
+            drained += 1
+
+    async def _reset_wakeword_listening(self):
+        drained = self._drain_wake_audio_queue()
+        if self._wake_detector:
+            await asyncio.to_thread(self._wake_detector.reset)
+        if self._wake_event:
+            self._wake_event.clear()
+        print(f"[JARVIS] 💤 Wake word listener reset ({drained} queued chunks cleared)")
+
     def _enqueue_realtime_audio(self, data: bytes):
         if not self.out_queue:
             return
@@ -1153,6 +1173,7 @@ class JarvisLive:
                     traceback.print_exc()
 
                 self.set_speaking(False)
+                await self._reset_wakeword_listening()
                 self.ui.set_state("SLEEPING")
                 self.ui.write_log("SYS: JARVIS sleeping. Waiting for wake word.")
         finally:

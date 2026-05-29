@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,15 @@ class WakeWordDetector:
         self.frame_samples = frame_samples
         self._buffer = np.empty(0, dtype=np.int16)
         self._last_detection = 0.0
+        self._lock = threading.Lock()
+
+    def reset(self):
+        with self._lock:
+            self._buffer = np.empty(0, dtype=np.int16)
+            self._last_detection = 0.0
+            reset_model = getattr(self.model, "reset", None)
+            if callable(reset_model):
+                reset_model()
 
     def process_bytes(self, data: bytes):
         if not data:
@@ -58,25 +68,26 @@ class WakeWordDetector:
         return self.process_audio(np.frombuffer(data, dtype=np.int16))
 
     def process_audio(self, audio):
-        samples = np.asarray(audio, dtype=np.int16).reshape(-1)
-        if samples.size == 0:
-            return None
+        with self._lock:
+            samples = np.asarray(audio, dtype=np.int16).reshape(-1)
+            if samples.size == 0:
+                return None
 
-        self._buffer = np.concatenate((self._buffer, samples))
-        while self._buffer.size >= self.frame_samples:
-            frame = self._buffer[: self.frame_samples].copy()
-            self._buffer = self._buffer[self.frame_samples :]
-            scores = self.model.predict(frame)
-            now = time.monotonic()
+            self._buffer = np.concatenate((self._buffer, samples))
+            while self._buffer.size >= self.frame_samples:
+                frame = self._buffer[: self.frame_samples].copy()
+                self._buffer = self._buffer[self.frame_samples :]
+                scores = self.model.predict(frame)
+                now = time.monotonic()
 
-            for name, confidence in scores.items():
-                if (
-                    confidence >= self.threshold
-                    and now - self._last_detection >= self.debounce_seconds
-                ):
-                    self._last_detection = now
-                    self._buffer = np.empty(0, dtype=np.int16)
-                    return name, float(confidence)
+                for name, confidence in scores.items():
+                    if (
+                        confidence >= self.threshold
+                        and now - self._last_detection >= self.debounce_seconds
+                    ):
+                        self._last_detection = now
+                        self._buffer = np.empty(0, dtype=np.int16)
+                        return name, float(confidence)
 
         return None
 
