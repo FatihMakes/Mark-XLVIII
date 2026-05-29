@@ -1,4 +1,5 @@
 import asyncio
+import array
 import contextlib
 import re
 import signal
@@ -53,6 +54,7 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 DEFAULT_CONVERSATION_IDLE_SLEEP_SECONDS = 60
 DEFAULT_WAKE_WORD_MODEL = "nee_how__ahh_niu.onnx"
+OUTPUT_SILENCE_RMS_THRESHOLD = 200
 
 def _load_app_config() -> dict:
     config = {
@@ -95,10 +97,25 @@ def _load_system_prompt() -> str:
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
-def _clean_transcript(text: str) -> str:    
+def _clean_transcript(text: str) -> str:
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
+
+def _is_silent_pcm16(data: bytes, threshold: int = OUTPUT_SILENCE_RMS_THRESHOLD) -> bool:
+    usable_len = len(data) - (len(data) % 2)
+    if usable_len <= 0:
+        return True
+
+    samples = array.array("h")
+    samples.frombytes(data[:usable_len])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    if not samples:
+        return True
+
+    limit = threshold * threshold * len(samples)
+    return sum(sample * sample for sample in samples) <= limit
 
 TOOL_DECLARATIONS = [
     {
@@ -928,7 +945,8 @@ class JarvisLive:
                     activity_seen = False
 
                     if response.data:
-                        activity_seen = True
+                        audio_is_silent = _is_silent_pcm16(response.data)
+                        activity_seen = activity_seen or not audio_is_silent
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
                         self.audio_in_queue.put_nowait(response.data)
@@ -1013,8 +1031,12 @@ class JarvisLive:
                         if self._sleep_after_turn and self._sleep_event:
                             self._sleep_event.set()
                     continue
-                self.set_speaking(True)
-                self._mark_conversation_activity()
+                audio_is_silent = _is_silent_pcm16(chunk)
+                if audio_is_silent:
+                    self.set_speaking(False)
+                else:
+                    self.set_speaking(True)
+                    self._mark_conversation_activity()
                 await asyncio.to_thread(stream.write, chunk)
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
