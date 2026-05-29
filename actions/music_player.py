@@ -5,6 +5,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -28,20 +29,17 @@ BASE_DIR = _get_base_dir()
 CACHE_DIR = BASE_DIR / "cache" / "music"
 
 SEARCH_URL = "http://search.kuwo.cn/r.s"
-PLAY_URL = "http://api.xiaodaokg.com/kuwo.php"
+URL_API = "https://lxmusicapi.onrender.com"
+URL_API_KEY = "share-v3"
 LYRIC_URL = "http://m.kuwo.cn/newh5/singles/songinfoandlrc"
+DEFAULT_BR = "320k"
+SEARCH_LIMIT = 20
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/91.0.4472.124 Safari/537.36"
-    ),
-    "Accept": "*/*",
-    "Accept-Encoding": "identity",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Connection": "keep-alive",
-    "Referer": "https://y.kuwo.cn/",
-    "Cookie": "",
 }
 
 
@@ -64,18 +62,6 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-def _extract_quoted_value(text: str, key: str) -> str:
-    marker = f'"{key}":"'
-    start = text.find(marker)
-    if start == -1:
-        return ""
-    start += len(marker)
-    end = text.find('"', start)
-    if end == -1:
-        return ""
-    return text[start:end]
 
 
 def _sanitize_filename(value: str) -> str:
@@ -201,44 +187,52 @@ class MusicPlayer:
             return {"status": "error", "message": f"搜索歌曲失败: {e}"}
 
     def _get_song_info(self, song_name: str) -> tuple[str, str]:
-        search_params = {
-            "all": song_name,
-            "ft": "music",
-            "newsearch": "1",
-            "alflac": "1",
-            "itemset": "web_2013",
-            "client": "kt",
-            "cluster": "0",
-            "pn": "0",
-            "rn": "1",
-            "vermerge": "1",
-            "rformat": "json",
-            "encoding": "utf8",
-            "show_copyright_off": "1",
-            "pcmp4": "1",
-            "ver": "mbox",
-            "vipver": "MUSIC_8.7.6.0.BCS31",
-            "plat": "pc",
-            "devid": "0",
-        }
+        keyword_encoded = quote(song_name)
+        search_url = (
+            f"{SEARCH_URL}"
+            f"?client=kt&all={keyword_encoded}&pn=0&rn={SEARCH_LIMIT}"
+            f"&uid=794762570&ver=kwplayer_ar_9.2.2.1&vipver=1"
+            f"&show_copyright_off=1&newver=1&ft=music&cluster=0"
+            f"&strategy=2012&encoding=utf8&rformat=json&vermerge=1"
+            f"&mobi=1&issubtitle=1"
+        )
 
+        response = None
         try:
-            response = requests.get(SEARCH_URL, params=search_params, headers=HEADERS, timeout=10)
-            response.raise_for_status()
+            for attempt in range(3):
+                try:
+                    response = requests.get(search_url, headers=HEADERS, timeout=10)
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.Timeout:
+                    if attempt < 2:
+                        print(f"[Music] search timeout, retrying ({attempt + 1}/2)")
+                        continue
+                    print(f"[Music] search timed out after retries: {song_name}")
+                    return "", ""
+            if response is None:
+                return "", ""
+            data = response.json()
         except Exception as e:
             print(f"[Music] search request failed: {e}")
             return "", ""
 
-        response_text = response.text.replace("'", '"')
-        song_id = _extract_quoted_value(response_text, "DC_TARGETID")
-        if not song_id:
+        results = data.get("abslist", [])
+        if not results:
+            print(f"[Music] no search results: {song_name}")
             return "", ""
 
-        duration_text = _extract_quoted_value(response_text, "DURATION")
-        duration = _safe_int(duration_text)
-        artist = _extract_quoted_value(response_text, "ARTIST")
-        title = _extract_quoted_value(response_text, "NAME") or song_name
-        album = _extract_quoted_value(response_text, "ALBUM")
+        first_result = results[0]
+        music_rid = first_result.get("MUSICRID", "")
+        song_id = music_rid.replace("MUSIC_", "") if music_rid else ""
+        if not song_id:
+            print("[Music] search result did not include MUSICRID")
+            return "", ""
+
+        title = first_result.get("SONGNAME", song_name)
+        artist = first_result.get("ARTIST", "")
+        album = first_result.get("ALBUM", "")
+        duration = _safe_int(first_result.get("DURATION"))
 
         display_name = title
         if artist:
@@ -250,65 +244,92 @@ class MusicPlayer:
             self.current_song = display_name
             self.total_duration = duration
 
-        play_api_url = f"{PLAY_URL}?ID={song_id}"
-        for attempt in range(3):
-            try:
-                url_response = requests.get(play_api_url, headers=HEADERS, timeout=10)
-                url_response.raise_for_status()
-                play_url_text = url_response.text.strip()
-                if play_url_text.startswith("http"):
-                    self._fetch_lyrics(song_id)
-                    return song_id, play_url_text
-                print(f"[Music] invalid play URL response: {play_url_text[:100]}")
-            except Exception as e:
-                print(f"[Music] play URL request failed ({attempt + 1}/3): {e}")
-            if attempt < 2:
-                time.sleep(1)
-
-        return song_id, ""
+        play_url = f"{URL_API}/url/kw/{song_id}/{DEFAULT_BR}"
+        self._fetch_lyrics(song_id)
+        return song_id, play_url
 
     def _fetch_lyrics(self, song_id: str) -> None:
         try:
-            response = requests.get(f"{LYRIC_URL}?musicId={song_id}", headers=HEADERS, timeout=10)
+            response = requests.get(
+                LYRIC_URL,
+                params={"musicId": song_id},
+                headers=HEADERS,
+                timeout=10,
+            )
             response.raise_for_status()
             data = response.json()
         except Exception as e:
             print(f"[Music] lyric request failed: {e}")
             return
 
-        if not (data.get("status") == 200 and data.get("data") and data["data"].get("lrclist")):
+        if data.get("status") != 200:
             return
 
         lyrics = []
-        for item in data["data"].get("lrclist", []):
-            try:
-                time_sec = float(item.get("time", "0"))
-            except (TypeError, ValueError):
-                time_sec = 0.0
+        metadata_prefixes = ("作词", "作曲", "编曲", "制作", "演唱", "原唱", "翻唱")
+        for item in data.get("data", {}).get("lrclist", []):
+            time_str = item.get("time", "")
             text = (item.get("lineLyric") or "").strip()
-            if text and not text.startswith(("作词", "作曲", "编曲")):
+            if not text or not time_str:
+                continue
+            try:
+                time_sec = float(time_str)
+            except (TypeError, ValueError):
+                continue
+            if not text.startswith(metadata_prefixes):
                 lyrics.append((time_sec, text))
 
         with self._lock:
             self.lyrics = lyrics
+            if self.total_duration == 0 and lyrics:
+                self.total_duration = lyrics[-1][0] + 5.0
+
+    def _resolve_download_url(self, api_url: str) -> str | None:
+        headers = {
+            "X-Request-Key": URL_API_KEY,
+            "User-Agent": "lx-music-request",
+        }
+        try:
+            response = requests.get(api_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            print(f"[Music] resolve download URL failed: {e}")
+            return None
+
+        real_url = None
+        if isinstance(data, dict):
+            real_url = data.get("url")
+            if not real_url:
+                inner = data.get("data")
+                if isinstance(inner, dict):
+                    real_url = inner.get("url")
+                elif isinstance(inner, str):
+                    real_url = inner
+
+        if not real_url:
+            print(f"[Music] could not extract download URL from API response: {data}")
+            return None
+        return real_url
 
     def _download_file(self, url: str, file_path: Path) -> bool:
-        headers = HEADERS.copy()
-        headers.update({"Accept-Encoding": "gzip, deflate, br", "Referer": "https://music.163.com/"})
+        download_url = self._resolve_download_url(url)
+        if not download_url:
+            return False
+
         temp_path = file_path.with_name(f"{file_path.name}.{int(time.time())}.tmp")
 
         try:
-            with requests.get(url, stream=True, headers=headers, timeout=30) as response:
+            with requests.get(download_url, stream=True, headers=HEADERS, timeout=30) as response:
                 response.raise_for_status()
-                total_size = _safe_int(response.headers.get("content-length"))
                 downloaded = 0
                 with open(temp_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=32768):
+                    for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
 
-            if downloaded <= 0 or (total_size > 0 and downloaded != total_size):
+            if downloaded <= 0:
                 temp_path.unlink(missing_ok=True)
                 return False
 
