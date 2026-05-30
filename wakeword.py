@@ -15,7 +15,7 @@ SAMPLE_RATE = 16000
 FRAME_SAMPLES = 1280
 THRESHOLD = 0.5
 DEBOUNCE_SECONDS = 2.0
-CUSTOM_MODEL = BASE_DIR / "nee_how__ahh_niu.onnx"
+CUSTOM_MODEL = BASE_DIR / "models" / "nee_how__ahh_niu.onnx"
 FALLBACK_MODEL = "hey_jarvis"
 
 

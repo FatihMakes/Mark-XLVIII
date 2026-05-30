@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import sys
 import threading
@@ -34,6 +35,9 @@ URL_API_KEY = "share-v3"
 LYRIC_URL = "http://m.kuwo.cn/newh5/singles/songinfoandlrc"
 DEFAULT_BR = "320k"
 SEARCH_LIMIT = 20
+PLAYBACK_START_GRACE_SECONDS = 2.0
+PLAYBACK_FINISH_BUSY_MISSES = 5
+LOCAL_AUDIO_SUFFIXES = {".mp3", ".wav", ".ogg", ".flac", ".m4a"}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -88,6 +92,7 @@ class MusicPlayer:
         self.progress_thread: threading.Thread | None = None
         self.stop_progress = threading.Event()
         self.current_temp_file: Path | None = None
+        self._local_play_queue: list[Path] = []
 
         self._lock = threading.RLock()
         self._mixer_ready = False
@@ -145,6 +150,114 @@ class MusicPlayer:
 
     def _get_cache_path(self, song_id: str) -> Path:
         return CACHE_DIR / f"{_sanitize_filename(song_id)}.mp3"
+
+    def _scan_local_songs(self) -> list[Path]:
+        if not CACHE_DIR.exists():
+            return []
+
+        songs = []
+        temp_dir = (CACHE_DIR / "temp").resolve()
+        for path in CACHE_DIR.iterdir():
+            if not path.is_file() or path.suffix.lower() not in LOCAL_AUDIO_SUFFIXES:
+                continue
+            try:
+                if path.resolve().is_relative_to(temp_dir):
+                    continue
+            except ValueError:
+                pass
+            songs.append(path)
+        return songs
+
+    def _display_name_from_file(self, file_path: Path) -> str:
+        return file_path.stem.replace("_", " ").strip() or file_path.name
+
+    def _play_local_file(self, file_path: Path, playlist_queue: list[Path] | None = None) -> bool:
+        ok, error = self._ensure_mixer()
+        if not ok:
+            print(f"[Music] {error}")
+            return False
+
+        file_path = Path(file_path)
+        if not file_path.exists() or not file_path.is_file():
+            return False
+
+        with self._lock:
+            if self.is_playing:
+                self.stop()
+
+            try:
+                pygame.mixer.music.load(str(file_path))
+                pygame.mixer.music.play()
+                self.current_song = self._display_name_from_file(file_path)
+                self.current_url = ""
+                self.song_id = file_path.stem
+                self.total_duration = 0
+                self.lyrics = []
+                self.current_lyric_index = -1
+                self.is_playing = True
+                self.paused = False
+                self.current_position = 0.0
+                self.start_play_time = time.time()
+                self.current_temp_file = None
+                self._local_play_queue = list(playlist_queue or [])
+                self._start_progress_thread()
+                return True
+            except Exception as e:
+                print(f"[Music] local play failed: {e}")
+                self.is_playing = False
+                return False
+
+    def _play_next_local_queue_item(self) -> bool:
+        with self._lock:
+            while self._local_play_queue:
+                file_path = self._local_play_queue.pop(0)
+                if not file_path.exists() or not file_path.is_file():
+                    continue
+                try:
+                    pygame.mixer.music.load(str(file_path))
+                    pygame.mixer.music.play()
+                    self.current_song = self._display_name_from_file(file_path)
+                    self.current_url = ""
+                    self.song_id = file_path.stem
+                    self.total_duration = 0
+                    self.lyrics = []
+                    self.current_lyric_index = -1
+                    self.is_playing = True
+                    self.paused = False
+                    self.current_position = 0.0
+                    self.start_play_time = time.time()
+                    _log(f"继续播放本地曲库: {self.current_song}，剩余 {len(self._local_play_queue)} 首")
+                    return True
+                except Exception as e:
+                    print(f"[Music] local queue play failed: {e}")
+            return False
+
+    def play_random_local(self) -> dict[str, Any]:
+        songs = self._scan_local_songs()
+        if not songs:
+            return {"status": "error", "message": "本地缓存目录没有可播放歌曲。"}
+
+        song = random.choice(songs)
+        if self._play_local_file(song):
+            return {"status": "success", "message": f"正在播放本地歌曲: {self.current_song}", "song": self.current_song}
+        return {"status": "error", "message": f"播放本地歌曲失败: {song.name}"}
+
+    def play_local_library(self) -> dict[str, Any]:
+        songs = self._scan_local_songs()
+        if not songs:
+            return {"status": "error", "message": "本地缓存目录没有可播放歌曲。"}
+
+        random.shuffle(songs)
+        first, queue = songs[0], songs[1:]
+        if self._play_local_file(first, playlist_queue=queue):
+            return {
+                "status": "success",
+                "message": f"正在随机播放本地曲库: {self.current_song}，剩余 {len(queue)} 首。",
+                "song": self.current_song,
+                "remaining": len(queue),
+                "total": len(songs),
+            }
+        return {"status": "error", "message": f"播放本地曲库失败: {first.name}"}
 
     def search_song(self, song_name: str) -> dict[str, Any]:
         song_name = (song_name or "").strip()
@@ -370,6 +483,7 @@ class MusicPlayer:
         with self._lock:
             if self.is_playing:
                 self.stop()
+            self._local_play_queue = []
 
             temp_dir = CACHE_DIR / "temp"
             temp_dir.mkdir(parents=True, exist_ok=True)
@@ -483,6 +597,7 @@ class MusicPlayer:
             self.paused = False
             self.current_position = 0.0
             self.current_temp_file = None
+            self._local_play_queue = []
             self._cleanup_temp_files(max_keep=1)
             return {"status": "success", "message": f"已停止播放: {current_song}"}
 
@@ -557,14 +672,59 @@ class MusicPlayer:
             self.progress_thread.join(timeout=1.0)
             self.stop_progress.clear()
 
-        self.progress_thread = threading.Thread(target=self._update_progress_thread, daemon=True)
+        self.progress_thread = threading.Thread(target=self._monitor_playback_thread, daemon=True)
         self.progress_thread.start()
 
-    def _update_progress_thread(self) -> None:
+    def _monitor_playback_thread(self) -> None:
+        busy_misses = 0
         while not self.stop_progress.is_set() and self.is_playing:
             if self.paused:
                 time.sleep(0.2)
                 continue
+
+            self.current_position = time.time() - self.start_play_time
+            try:
+                mixer_busy = pygame.mixer.music.get_busy()
+            except Exception:
+                mixer_busy = True
+
+            if mixer_busy:
+                busy_misses = 0
+            elif self.current_position >= PLAYBACK_START_GRACE_SECONDS:
+                busy_misses += 1
+            else:
+                busy_misses = 0
+
+            if busy_misses >= PLAYBACK_FINISH_BUSY_MISSES:
+                if self._play_next_local_queue_item():
+                    busy_misses = 0
+                    continue
+                self.is_playing = False
+                self.paused = False
+                _log(f"鎾斁瀹屾垚: {self.current_song}")
+                break
+
+            time.sleep(0.1)
+
+    def _update_progress_thread(self) -> None:
+        self._monitor_playback_thread()
+        return
+
+        while not self.stop_progress.is_set() and self.is_playing:
+            if self.paused:
+                time.sleep(0.2)
+                continue
+
+            try:
+                mixer_busy = pygame.mixer.music.get_busy()
+            except Exception:
+                mixer_busy = True
+
+            if not mixer_busy:
+                self.is_playing = False
+                self.paused = False
+                _log(f"鎾斁瀹屾垚: {self.current_song}")
+                break
 
             self.current_position = time.time() - self.start_play_time
             if self.total_duration > 0 and self.current_position >= self.total_duration:
@@ -608,6 +768,12 @@ def music_player(parameters: dict, response=None, player=None, session_memory=No
             else:
                 result = _PLAYER.play()
             message = result.get("message", "音乐已播放。")
+        elif action in {"play_local", "local", "random_local", "play_local_song"}:
+            result = _PLAYER.play_random_local()
+            message = result.get("message", "本地歌曲已播放。")
+        elif action in {"play_local_library", "local_library", "play_library", "local_playlist"}:
+            result = _PLAYER.play_local_library()
+            message = result.get("message", "本地曲库已开始播放。")
         elif action == "pause":
             result = _PLAYER.pause()
             message = result.get("message", "音乐已暂停。")

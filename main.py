@@ -36,7 +36,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
-from actions.music_player      import music_player
+from actions.music_player      import get_music_player, music_player
 
 
 def get_base_dir():
@@ -47,7 +47,7 @@ def get_base_dir():
 
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-APP_CONFIG_PATH = BASE_DIR / "config" / "app_config.json"
+APP_CONFIG_PATH = BASE_DIR / "config" / "config.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
@@ -55,12 +55,13 @@ SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 DEFAULT_CONVERSATION_IDLE_SLEEP_SECONDS = 60
-DEFAULT_WAKE_WORD_MODEL = "nee_how__ahh_niu.onnx"
+DEFAULT_WAKE_WORD_MODEL = "models/nee_how__ahh_niu.onnx"
 OUTPUT_SILENCE_RMS_THRESHOLD = 200
 READY_CHIME_SAMPLE_RATE = 24000
 READY_CHIME_DURATION_SECONDS = 0.18
 READY_CHIME_FREQUENCY_HZ = 880
 READY_CHIME_VOLUME = 0.22
+MUSIC_WAKE_GRACE_SECONDS = 3.0
 
 def _load_app_config() -> dict:
     config = {
@@ -216,6 +217,7 @@ TOOL_DECLARATIONS = [
         "description": (
             "Searches online music by keyword, downloads the selected song, plays it locally, "
             "and controls music playback. Use for ALL music/song requests: play music, search songs, "
+            "play a random cached local song, play the cached local library in random order, "
             "pause music, resume music, stop music, toggle playback, seek within a song, get lyrics, "
             "or check music status. Do NOT use youtube_video, web_search, or open_app for music playback."
         ),
@@ -224,7 +226,7 @@ TOOL_DECLARATIONS = [
             "properties": {
                 "action": {
                     "type": "STRING",
-                    "description": "search_play | search | play | pause | resume | toggle | stop | seek | lyrics | status (default: search_play)"
+                    "description": "search_play | search | play | play_local | play_local_library | pause | resume | toggle | stop | seek | lyrics | status (default: search_play). Use play_local for 播放本地歌曲 without a song name. Use play_local_library for 播放本地曲库 without a song name."
                 },
                 "query": {
                     "type": "STRING",
@@ -580,6 +582,10 @@ class JarvisLive:
         self._shutdown_event: asyncio.Event | None = None
         self._conversation_active = False
         self._conversation_starting = False
+        self._music_sleep_active = False
+        self._music_sleep_requested = False
+        self._wake_after_music = False
+        self._music_sleep_started_at = 0.0
         self._startup_audio_buffer = []
         self._pending_text_commands: list[str] = []
         self._pending_text_lock = threading.Lock()
@@ -621,6 +627,73 @@ class JarvisLive:
     def _mark_conversation_activity(self):
         self._last_conversation_activity = asyncio.get_running_loop().time()
 
+    def _music_is_playing(self) -> bool:
+        try:
+            status = get_music_player().status()
+        except Exception:
+            return False
+        return bool(status.get("playing") and not status.get("paused"))
+
+    def _begin_music_sleep(self):
+        if not self._music_is_playing():
+            return
+        if not self._music_sleep_active:
+            self._music_sleep_active = True
+            self.ui.write_log("SYS: Music playback started. Sleeping until playback ends or wake word is detected.")
+            self.ui.set_state("SLEEPING")
+        self._music_sleep_started_at = asyncio.get_running_loop().time()
+        self._music_sleep_requested = True
+        self._wake_after_music = False
+        self._drain_wake_audio_queue()
+
+    def _wake_from_music_sleep(self):
+        if not self._music_sleep_active:
+            return
+        try:
+            get_music_player().pause()
+        except Exception as e:
+            self.ui.write_log(f"ERR: Failed to pause music on wake word - {str(e)[:120]}")
+        self._music_sleep_active = False
+        self._music_sleep_requested = False
+        self._wake_after_music = False
+        self._music_sleep_started_at = 0.0
+        self.ui.write_log("SYS: Wake word detected during music playback. Music paused for conversation.")
+
+    def _finish_music_sleep(self):
+        if not self._music_sleep_active:
+            return
+        conversation_is_stopping = bool(self._sleep_event and self._sleep_event.is_set())
+        self._music_sleep_active = False
+        self._music_sleep_requested = False
+        self._music_sleep_started_at = 0.0
+        self._drain_wake_audio_queue()
+        self.ui.write_log("SYS: Music playback ended. Returning to conversation mode.")
+        if self._conversation_active and not conversation_is_stopping:
+            self._wake_after_music = False
+            self.ui.set_state("LISTENING" if not self.ui.muted else "SLEEPING")
+            return
+
+        self._wake_after_music = True
+        self.ui.set_state("THINKING")
+        if not self._conversation_active and not self._conversation_starting:
+            if self._wake_event and not self._wake_event.is_set():
+                self._wake_event.set()
+
+    async def _watch_music_sleep(self):
+        while True:
+            if self._music_sleep_active and not self._music_is_playing():
+                self._finish_music_sleep()
+            await asyncio.sleep(0.25)
+
+    def _activate_music_sleep_after_tool_response(self):
+        if not self._music_sleep_requested:
+            return
+        self._music_sleep_requested = False
+        if self._music_sleep_active and self._music_is_playing() and self._sleep_event:
+            self._sleep_event.set()
+        else:
+            self._finish_music_sleep()
+
     async def _watch_conversation_idle(self):
         timeout = self._conversation_idle_sleep_seconds
         if timeout <= 0:
@@ -649,6 +722,9 @@ class JarvisLive:
             if self.session and self._conversation_active:
                 asyncio.create_task(self._send_text_command(text))
                 return
+
+            if self._music_sleep_active:
+                self._wake_from_music_sleep()
 
             self._queue_text_command(text)
             if self._conversation_starting:
@@ -884,6 +960,8 @@ class JarvisLive:
             elif name == "music_player":
                 r = await loop.run_in_executor(None, lambda: music_player(parameters=args, response=None, player=self.ui))
                 result = {"status": "ok", "result": r or "Done.", "silent": True}
+                if self._music_is_playing():
+                    self._begin_music_sleep()
 
             elif name == "screen_process":
                 threading.Thread(
@@ -987,7 +1065,14 @@ class JarvisLive:
                 name, confidence = detection
                 print(f"[JARVIS] 🟢 Wake word: {name} ({confidence:.2f})")
                 self.ui.write_log(f"SYS: Wake word detected ({name}, {confidence:.2f}).")
-                self._wake_event.set()
+                if self._music_sleep_active:
+                    elapsed = asyncio.get_running_loop().time() - self._music_sleep_started_at
+                    if elapsed < MUSIC_WAKE_GRACE_SECONDS:
+                        self.ui.write_log("SYS: Ignoring wake word during music startup grace period.")
+                        continue
+                    self._wake_from_music_sleep()
+                if not self._music_sleep_active:
+                    self._wake_event.set()
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
@@ -1011,6 +1096,7 @@ class JarvisLive:
 
             if (
                 self._conversation_active
+                and not self._music_sleep_active
                 and not jarvis_speaking
                 and not self._tool_running
                 and not self.ui.muted
@@ -1097,6 +1183,7 @@ class JarvisLive:
                             await self.session.send_tool_response(
                                 function_responses=fn_responses
                             )
+                            self._activate_music_sleep_after_tool_response()
                         finally:
                             self._tool_running = False
 
@@ -1231,6 +1318,7 @@ class JarvisLive:
 
         mic_task = asyncio.create_task(self._listen_audio())
         wake_task = asyncio.create_task(self._wait_for_wakeword())
+        music_task = asyncio.create_task(self._watch_music_sleep())
 
         self.ui.set_state("SLEEPING")
         self.ui.write_log("SYS: JARVIS sleeping. Waiting for wake word.")
@@ -1251,6 +1339,8 @@ class JarvisLive:
                     break
 
                 self._wake_event.clear()
+                if self._wake_after_music:
+                    self._wake_after_music = False
 
                 try:
                     await self._run_conversation(client)
@@ -1260,12 +1350,18 @@ class JarvisLive:
 
                 self.set_speaking(False)
                 await self._reset_wakeword_listening()
+                if self._wake_after_music:
+                    self._wake_after_music = False
+                    if self._wake_event and not self._wake_event.is_set():
+                        self._wake_event.set()
+                    continue
                 self.ui.set_state("SLEEPING")
                 self.ui.write_log("SYS: JARVIS sleeping. Waiting for wake word.")
         finally:
             mic_task.cancel()
             wake_task.cancel()
-            await asyncio.gather(mic_task, wake_task, return_exceptions=True)
+            music_task.cancel()
+            await asyncio.gather(mic_task, wake_task, music_task, return_exceptions=True)
             self._shutdown_event = None
 
 def main():
