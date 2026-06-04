@@ -1,0 +1,124 @@
+{
+  "_comment": "Agent manifests for MARK XXXIX (orchestration Tiers 2 & 6). Each agent is data: its model, its tool allowlist (least privilege), and a bounded-loop cap. Edit this file at runtime to add/retire agents with no restart (ManifestStore watches the mtime). 'jarvis' is the top-level voice orchestrator; 'task' is the bounded autonomous executor and is intentionally NOT allowed to message people or power off the machine.",
+  "agents": [
+    {
+      "name": "jarvis",
+      "description": "Top-level voice orchestrator. Routes user intent to tools and the task agent.",
+      "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+      "tools": [
+        "*"
+      ],
+      "max_iterations": 12,
+      "active": true
+    },
+    {
+      "name": "task",
+      "description": "Bounded autonomous executor for multi-step goals. Least-privilege: no messaging, no shutdown, no game installs.",
+      "model": "gemini-2.5-flash-lite",
+      "tools": [
+        "open_app",
+        "web_search",
+        "weather_report",
+        "youtube_video",
+        "flight_finder",
+        "browser_control",
+        "file_controller",
+        "code_helper",
+        "computer_control",
+        "desktop_control",
+        "screen_process",
+        "reminder"
+      ],
+      "max_iterations": 6,
+      "active": true
+    },
+    {
+      "name": "eva",
+      "role": "gold & numbers desk",
+      "description": "Handles gold, metals, prices and any numeric / market-data lookup.",
+      "model": "qwen3:14b",
+      "dispatchable": true,
+      "keywords": [
+        "gold",
+        "xau",
+        "price",
+        "number",
+        "metal",
+        "silver",
+        "rate",
+        "quote",
+        "ounce",
+        "ذهب",
+        "سعر",
+        "رقم"
+      ],
+      "tools": [
+        "web_search",
+        "file_controller",
+        "tradingview"
+      ],
+      "max_iterations": 5,
+      "requires_confirmation": false,
+      "system_prompt": "You are Eva, the gold and numbers desk. Answer price and numeric questions precisely using web_search for live data. Cite the figure and its source. If the user clearly wants to act on a price (buy/sell), propose_handoff to tom rather than acting yourself.",
+      "active": true
+    },
+    {
+      "name": "bobby",
+      "role": "market news desk",
+      "description": "Handles market news, headlines and what's moving markets.",
+      "model": "qwen3:14b",
+      "dispatchable": true,
+      "keywords": [
+        "news",
+        "headline",
+        "market",
+        "report",
+        "story",
+        "announcement",
+        "fed",
+        "earnings",
+        "أخبار",
+        "خبر",
+        "سوق"
+      ],
+      "tools": [
+        "web_search",
+        "browser_control",
+        "file_controller"
+      ],
+      "max_iterations": 5,
+      "requires_confirmation": false,
+      "system_prompt": "You are Bobby, the market news desk. Summarise current market news with web_search, newest first, with sources. If a headline implies a trade the user wants, propose_handoff to tom; if they want exact prices, propose_handoff to eva. Never trade yourself.",
+      "active": true
+    },
+    {
+      "name": "tom",
+      "role": "trade execution desk",
+      "description": "Handles buy / sell orders. Every order is a money move and requires explicit human confirmation.",
+      "model": "qwen3:14b",
+      "dispatchable": true,
+      "keywords": [
+        "buy",
+        "sell",
+        "order",
+        "trade",
+        "execute",
+        "position",
+        "long",
+        "short",
+        "شراء",
+        "بيع",
+        "أمر",
+        "صفقة"
+      ],
+      "tools": [
+        "web_search",
+        "tradingview"
+      ],
+      "max_iterations": 4,
+      "requires_confirmation": true,
+      "system_prompt": "You are Tom, the trade execution desk. Restate the order (instrument, side, size, price) clearly and confirm understanding. You do NOT have a live broker tool wired yet, so describe exactly what order you WOULD place and stop. Never invent a fill.",
+      "active": true
+    }
+  ]
+}

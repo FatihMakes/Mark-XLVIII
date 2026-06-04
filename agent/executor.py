@@ -171,7 +171,47 @@ def _translate_to_goal_language(content: str, goal: str) -> str:
         print(f"[Executor] ⚠️ Translation failed: {e}")
         return content
 
+# --- Tier 2: least-privilege scoping for the autonomous task agent --------------
+# The executor runs goals with NO human in the loop, so it must not be able to reach
+# tools that message real people or power off the machine. The allowlist is the
+# 'task' agent's manifest (config/agents.json); if that can't be read we fall back to
+# a conservative hardcoded set rather than opening everything.
+_FALLBACK_TASK_ALLOWLIST = frozenset({
+    "open_app", "web_search", "weather_report", "youtube_video", "flight_finder",
+    "browser_control", "file_controller", "code_helper", "computer_control",
+    "desktop_control", "screen_process", "reminder", "generated_code",
+})
+_TASK_ALLOWLIST: frozenset[str] | None = None
+
+
+def _task_allowlist() -> frozenset[str]:
+    global _TASK_ALLOWLIST
+    if _TASK_ALLOWLIST is not None:
+        return _TASK_ALLOWLIST
+    try:
+        from core.manifest import ManifestStore
+        agents = ManifestStore(BASE_DIR / "config" / "agents.json").load()
+        task = agents.get("task")
+        if task and not task.allows_all_tools():
+            # generated_code is an internal fallback tool, always permitted.
+            _TASK_ALLOWLIST = frozenset(task.tools) | {"generated_code"}
+        else:
+            _TASK_ALLOWLIST = _FALLBACK_TASK_ALLOWLIST
+    except Exception as e:
+        print(f"[Executor] ⚠️ allowlist load failed ({e}); using safe fallback")
+        _TASK_ALLOWLIST = _FALLBACK_TASK_ALLOWLIST
+    return _TASK_ALLOWLIST
+
+
 def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
+
+    # Least-privilege gate: reject tools the autonomous agent has no business calling.
+    # The error flows into the normal step-recovery path (analyze_error -> replan/abort).
+    if tool not in _task_allowlist():
+        raise PermissionError(
+            f"Tool '{tool}' is not permitted for the autonomous task agent "
+            f"(least privilege — needs a human in the loop)."
+        )
 
     if tool == "open_app":
         from actions.open_app import open_app
