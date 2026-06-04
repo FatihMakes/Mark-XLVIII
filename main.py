@@ -43,6 +43,10 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# Role agents (Eva/Bobby/Tom) run on a local Ollama model; the voice front-end stays
+# on Gemini because qwen3:14b has no native-audio modality.
+OLLAMA_HOST         = "http://127.0.0.1:11434"
+ROLE_LLM_BACKEND    = "ollama"   # "ollama" (local qwen3:14b) | "gemini"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -449,6 +453,39 @@ TOOL_DECLARATIONS = [
     }
 },
     {
+        "name": "send_alert",
+        "description": (
+            "Send a Telegram alert to the configured chat. Use for price alerts, "
+            "news alerts, or any notification that should reach the user's phone. "
+            "Does NOT replace send_message (which sends to specific contacts)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "message": {"type": "STRING", "description": "The alert text (Markdown supported)"},
+            },
+            "required": ["message"],
+        },
+    },
+    {
+        "name": "tradingview",
+        "description": (
+            "Live market analysis from TradingView: current price, the BUY/SELL/NEUTRAL "
+            "recommendation, and key indicators (RSI, MACD, EMAs) for a symbol. "
+            "Use for gold, silver, BTC, ETH, EUR/USD and similar. Does NOT place orders."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "symbol":   {"type": "STRING", "description": "What to analyse: gold, XAUUSD, BTC, EURUSD, etc."},
+                "interval": {"type": "STRING", "description": "Timeframe: 1m, 5m, 15m, 1h, 4h, 1d (default 15m)"},
+                "exchange": {"type": "STRING", "description": "Optional exchange override (e.g. NASDAQ)"},
+                "screener": {"type": "STRING", "description": "Optional screener override (e.g. america, crypto, forex, cfd)"},
+            },
+            "required": ["symbol"],
+        },
+    },
+    {
         "name": "save_memory",
         "description": (
             "Save an important personal fact about the user to long-term memory. "
@@ -480,6 +517,177 @@ TOOL_DECLARATIONS = [
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Orchestration layer (Tier 4 confirmation gate + Tier 2 shared registry).
+#
+# Two extra tools let the model resolve a gate: when a risky tool (send_message,
+# shutdown_jarvis, ...) is called, the router stages it and returns a
+# confirmation_required payload instead of running it. The model voices the prompt;
+# once the user says yes it calls confirm_action(token); on no it calls cancel_action.
+# ---------------------------------------------------------------------------
+CONFIRM_TOOL_DECLARATIONS = [
+    {
+        "name": "confirm_action",
+        "description": (
+            "Execute a previously staged risky action AFTER the user has explicitly "
+            "approved it. Only call this when a prior tool returned "
+            "confirmation_required and the user said yes. Pass the token from that payload."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "token": {"type": "STRING", "description": "Token from the confirmation_required payload"}
+            },
+            "required": ["token"],
+        },
+    },
+    {
+        "name": "cancel_action",
+        "description": (
+            "Discard a staged risky action when the user declines it. "
+            "Pass the token from the confirmation_required payload."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "token": {"type": "STRING", "description": "Token from the confirmation_required payload"}
+            },
+            "required": ["token"],
+        },
+    },
+]
+
+
+def _build_registry():
+    """One source of truth for tool schemas + who-may-call + what-needs-confirmation."""
+    from core.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    reg.register_schemas(TOOL_DECLARATIONS)
+    reg.register_schemas(CONFIRM_TOOL_DECLARATIONS)
+    try:
+        meta = json.loads((BASE_DIR / "config" / "tools.json").read_text(encoding="utf-8"))
+        meta = {k: v for k, v in meta.items() if not k.startswith("_")}
+        reg.apply_metadata(meta)
+    except Exception as e:
+        print(f"[Registry] ⚠️ tool metadata load failed ({e}); tools run ungated")
+    return reg
+
+
+REGISTRY      = _build_registry()
+from core.confirmation import ConfirmationStore
+CONFIRMATIONS = ConfirmationStore()
+
+# ---------------------------------------------------------------------------
+# Role registry — Jarvis as orchestrator (Tiers 1 + 5 + 6).
+#
+# Jarvis routes named roles: Eva (gold/numbers), Bobby (market news),
+# Tom (buy/sell — gated). A role is a manifest in config/agents.json; the generic
+# RoleAgent runtime runs each one's bounded tool-use loop. Roles never call each other
+# — they PROPOSE a handoff and Jarvis asks the human before dispatching the next role.
+# ---------------------------------------------------------------------------
+from core.manifest import ManifestStore
+from core.roles import RoleRegistry
+from core.handoff import HandoffStore, HandoffRecommendation
+
+MANIFEST_STORE = ManifestStore(BASE_DIR / "config" / "agents.json")
+try:
+    MANIFEST_STORE.load()
+except Exception as e:
+    print(f"[Roles] ⚠️ manifest load failed: {e}")
+ROLE_REGISTRY = RoleRegistry(MANIFEST_STORE)
+HANDOFFS      = HandoffStore()
+
+# The black box: every routing decision, tool call, gate event and handoff is recorded
+# so a won/lost trade can be replayed and learned from. Writes are failure-isolated.
+from core.audit import AuditLog
+AUDIT = AuditLog(BASE_DIR / "logs" / "audit.db")
+
+ROLE_TOOL_DECLARATIONS = [
+    ROLE_REGISTRY.dispatch_tool_declaration(),
+    {
+        "name": "accept_handoff",
+        "description": (
+            "Dispatch a previously proposed handoff AFTER the user approves it. "
+            "Pass the token from the handoff_proposed payload."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"token": {"type": "STRING", "description": "Handoff token"}},
+            "required": ["token"],
+        },
+    },
+    {
+        "name": "reject_handoff",
+        "description": "Drop a proposed handoff the user declined. Pass its token.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"token": {"type": "STRING", "description": "Handoff token"}},
+            "required": ["token"],
+        },
+    },
+]
+REGISTRY.register_schemas(ROLE_TOOL_DECLARATIONS)
+
+
+def _gemini_role_model_fn(manifest, messages, tool_declarations):
+    """Adapter: run one bounded turn of a role agent against Gemini.
+
+    Stateless per call — it reconstructs context from ``messages`` (the RoleAgent owns
+    the loop and the bound). Returns a core.role_agent.ModelTurn. Any failure degrades
+    to a plain-text turn so a role can never crash the orchestrator (Tier 3).
+    """
+    from core.role_agent import ModelTurn, ToolCall
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=_get_api_key())
+        model = genai.GenerativeModel(
+            model_name=manifest.model,
+            system_instruction=manifest.system_prompt or manifest.description,
+            tools=[{"function_declarations": tool_declarations}],
+        )
+        task = messages[0]["content"] if messages else ""
+        context = "\n".join(
+            f"[{m.get('name', 'tool')}] {m['content']}"
+            for m in messages[1:]
+            if m.get("role") == "tool"
+        )
+        prompt = task if not context else f"{task}\n\nResults so far:\n{context}"
+
+        resp = model.generate_content(prompt)
+        calls = []
+        for cand in getattr(resp, "candidates", []) or []:
+            for part in getattr(cand.content, "parts", []) or []:
+                fc = getattr(part, "function_call", None)
+                if fc and getattr(fc, "name", ""):
+                    calls.append(ToolCall(fc.name, dict(getattr(fc, "args", {}) or {})))
+        if calls:
+            return ModelTurn(tool_calls=tuple(calls))
+        return ModelTurn(text=(getattr(resp, "text", "") or "Done.").strip())
+    except Exception as e:
+        return ModelTurn(text=f"Role '{manifest.name}' could not complete: {e}")
+
+
+def _ollama_role_model_fn(manifest, messages, tool_declarations):
+    """Adapter: run one bounded role-agent turn against local Ollama (qwen3:14b).
+
+    Tier 2/4 are untouched — this only changes WHICH model runs the turn. Tool
+    declarations and the dispatch guard are passed through exactly as before; the
+    backend just converts schema/messages and parses tool_calls (see
+    core.ollama_backend).
+    """
+    from core.ollama_backend import ollama_chat
+    return ollama_chat(manifest, messages, tool_declarations, host=OLLAMA_HOST)
+
+
+def _active_role_model_fn(manifest, messages, tool_declarations):
+    """Pick the role-agent backend (local Ollama by default, Gemini as a fallback)."""
+    if ROLE_LLM_BACKEND == "gemini":
+        return _gemini_role_model_fn(manifest, messages, tool_declarations)
+    return _ollama_role_model_fn(manifest, messages, tool_declarations)
+
+
 class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
@@ -492,6 +700,104 @@ class JarvisLive:
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
+        self._bind_role_tool_handlers()
+
+    def _bind_role_tool_handlers(self):
+        """Bind registry handlers for the tools role agents (Eva/Bobby/Tom) use.
+
+        The main flat agent still dispatches via _dispatch's if/elif; these bindings
+        let the generic RoleAgent reach the same underlying actions through the
+        registry (failure-isolated). Adapters capture self for the UI ref.
+        """
+        ui = self.ui
+        from core.tradingview import tradingview_tool
+        from core.telegram import send_alert_tool
+        bindings = {
+            "web_search":      lambda a, ctx: web_search_action(parameters=a, player=ui) or "Done.",
+            "file_controller": lambda a, ctx: file_controller(parameters=a, player=ui) or "Done.",
+            "browser_control": lambda a, ctx: browser_control(parameters=a, player=ui) or "Done.",
+            "tradingview":     lambda a, ctx: tradingview_tool(parameters=a, player=ui),
+            "send_alert":      lambda a, ctx: send_alert_tool(parameters=a, player=ui),
+        }
+        for tool_name, handler in bindings.items():
+            try:
+                if REGISTRY.has(tool_name):
+                    REGISTRY.bind(tool_name, handler)
+            except Exception as e:
+                print(f"[Roles] ⚠️ could not bind {tool_name}: {e}")
+
+    def _run_role(self, role_name: str, task: str, confirmed: bool = False):
+        """Run a named role's bounded agent. Returns a result string or a payload dict.
+
+        - Tom (requires_confirmation) stages a Tier-4 gate and returns the prompt.
+        - A role that proposes a handoff returns a handoff_proposed payload (Tier 5).
+        - Otherwise returns the role's final answer.
+        Runs on an executor thread (blocking Gemini calls).
+        """
+        from core.role_agent import RoleAgent
+
+        manifest = ROLE_REGISTRY.get(role_name)
+        if not manifest:
+            return f"Sir, there is no role named '{role_name}'."
+
+        # Tier 4: money-move roles need an explicit human yes before running.
+        if manifest.requires_confirmation and not confirmed:
+            action = CONFIRMATIONS.stage(
+                "dispatch_to_role",
+                {"role": role_name, "task": task, "_confirmed": True},
+                agent="jarvis",
+            )
+            AUDIT.record_decision(
+                "jarvis", "gate", target_role=role_name, task=task,
+                status="blocked", system_prompt=manifest.system_prompt,
+                detail=f"staged token={action.token}",
+            )
+            self.ui.write_log(f"GATE: dispatch to {role_name} awaiting confirmation")
+            return CONFIRMATIONS.confirmation_payload(action)
+
+        # Black box: open a decision row, then record every tool call under it.
+        decision_id = AUDIT.record_decision(
+            "jarvis", "dispatch", target_role=role_name, task=task,
+            status="pending", system_prompt=manifest.system_prompt,
+            detail=f"backend={ROLE_LLM_BACKEND}, confirmed={confirmed}",
+        )
+
+        allowed = set(manifest.tools)
+        tool_decls = REGISTRY.declarations_for(allowed)
+
+        def dispatch_fn(tname, targs):
+            if tname not in allowed:
+                AUDIT.record_tool_call(tname, decision_id=decision_id, actor=role_name,
+                                       args=targs, error="blocked: not in allowlist")
+                return f"Tool '{tname}' is not in {role_name}'s allowlist."
+            out = REGISTRY.dispatch(tname, targs, ctx=self, agent=None)
+            AUDIT.record_tool_call(tname, decision_id=decision_id, actor=role_name,
+                                   args=targs, result=out)
+            return out
+
+        agent = RoleAgent(manifest, tool_decls, dispatch_fn, _active_role_model_fn)
+        self.ui.write_log(f"→ {role_name} [{ROLE_LLM_BACKEND}]: {task[:50]}")
+        res = agent.run(task)
+
+        if res.handoff:
+            ph = HANDOFFS.propose(res.handoff, source_role=role_name)
+            AUDIT.record_handoff(
+                role_name, res.handoff.target_role, reason=res.handoff.reason,
+                token=ph.token, confidence=res.handoff.confidence,
+                decision_id=decision_id,
+            )
+            AUDIT.update_decision(decision_id, status="executed", result=res.result)
+            payload = HANDOFFS.payload(ph)
+            payload["result"] = res.result
+            self.ui.write_log(f"HANDOFF proposed: {role_name} → {res.handoff.target_role}")
+            return payload
+
+        AUDIT.update_decision(
+            decision_id,
+            status="executed" if res.converged else "failed",
+            result=res.result,
+        )
+        return res.result
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -543,7 +849,26 @@ class JarvisLive:
             f"Use this to calculate exact times for reminders.\n\n"
         )
 
-        parts = [time_ctx]
+        gate_policy = (
+            "[CONFIRMATION GATE]\n"
+            "Some tools are risky (sending messages, shutting down, installing games, "
+            "placing trades). When a tool returns a 'confirmation_required' payload, DO "
+            "NOT assume it ran. Tell the user plainly what is about to happen and ask for "
+            "a yes/no. Only after an explicit yes, call confirm_action with the token. "
+            "On a no, call cancel_action with the token.\n"
+            "When a role returns a 'handoff_proposed' payload, voice the offer and wait. "
+            "Only on an explicit yes call accept_handoff with the token; on no call "
+            "reject_handoff. Never dispatch the next role on your own.\n\n"
+        )
+
+        try:
+            role_policy = ROLE_REGISTRY.routing_policy()
+        except Exception:
+            role_policy = ""
+
+        parts = [time_ctx, gate_policy]
+        if role_policy:
+            parts.append(role_policy)
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -553,7 +878,7 @@ class JarvisLive:
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            tools=[{"function_declarations": REGISTRY.declarations(agent="jarvis")}],
             session_resumption=types.SessionResumptionConfig(),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -568,6 +893,70 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
+        # --- Tier 4: confirmation gate (decided before any handler runs) -----
+        if name == "confirm_action":
+            pending = CONFIRMATIONS.approve(args.get("token", ""))
+            if not pending:
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={"result": "There was no pending action to confirm, sir."},
+                )
+            print(f"[JARVIS] ✅ Confirmed → {pending.tool} {pending.args}")
+            AUDIT.record_decision("jarvis", "confirm", target_role=pending.args.get("role", ""),
+                                  task=str(pending.args.get("task", pending.tool)),
+                                  status="approved", detail=f"tool={pending.tool}")
+            self.ui.write_log(f"CONFIRMED: {pending.tool}")
+            return await self._dispatch(pending.tool, pending.args, fc.id)
+
+        if name == "cancel_action":
+            CONFIRMATIONS.reject(args.get("token", ""))
+            AUDIT.record_decision("jarvis", "confirm", status="rejected",
+                                  detail="user cancelled staged action")
+            self.ui.write_log("CANCELLED staged action")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "Action cancelled, sir."},
+            )
+
+        # --- Tier 5: handoff acceptance (propose -> human yes -> dispatch) ----
+        if name == "accept_handoff":
+            ph = HANDOFFS.accept(args.get("token", ""))
+            if not ph:
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={"result": "There was no pending handoff to accept, sir."},
+                )
+            AUDIT.resolve_handoff(ph.token, accepted=True)
+            self.ui.write_log(f"HANDOFF accepted → {ph.reco.target_role}")
+            # Re-enter normal dispatch; the target role re-checks its own gate (e.g. Tom).
+            return await self._dispatch(
+                "dispatch_to_role",
+                {"role": ph.reco.target_role, "task": ph.reco.task},
+                fc.id,
+            )
+
+        if name == "reject_handoff":
+            token = args.get("token", "")
+            HANDOFFS.reject(token)
+            AUDIT.resolve_handoff(token, accepted=False)
+            self.ui.write_log("HANDOFF rejected")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "Handoff dropped, sir."},
+            )
+
+        if REGISTRY.has(name) and REGISTRY.requires_confirmation(name):
+            action  = CONFIRMATIONS.stage(name, args, agent="jarvis")
+            payload  = CONFIRMATIONS.confirmation_payload(action)
+            print(f"[JARVIS] 🔒 Gate: {name} staged (token={action.token})")
+            self.ui.write_log(f"GATE: {name} awaiting your confirmation")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(id=fc.id, name=name, response=payload)
+
+        return await self._dispatch(name, args, fc.id)
+
+    async def _dispatch(self, name: str, args: dict, fc_id) -> types.FunctionResponse:
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
 
@@ -581,12 +970,27 @@ class JarvisLive:
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
-                id=fc.id, name=name,
+                id=fc_id, name=name,
                 response={"result": "ok", "silent": True}
             )
 
         loop   = asyncio.get_event_loop()
         result = "Done."
+
+        # --- Orchestrator: hand the task to a named role (Eva/Bobby/Tom) -----
+        if name == "dispatch_to_role":
+            confirmed = bool(args.pop("_confirmed", False))
+            role_name = args.get("role", "")
+            task      = args.get("task", "")
+            outcome   = await loop.run_in_executor(
+                None, lambda: self._run_role(role_name, task, confirmed)
+            )
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            # _run_role may return a plain answer (str) or a structured payload
+            # (confirmation_required / handoff_proposed) — pass either through.
+            response = outcome if isinstance(outcome, dict) else {"result": outcome}
+            return types.FunctionResponse(id=fc_id, name=name, response=response)
 
         try:
             if name == "open_app":
@@ -652,6 +1056,17 @@ class JarvisLive:
             elif name == "web_search":
                 r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
                 result = r or "Done."
+
+            elif name == "tradingview":
+                from core.tradingview import tradingview_tool
+                r = await loop.run_in_executor(None, lambda: tradingview_tool(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "send_alert":
+                from core.telegram import send_alert_tool
+                r = await loop.run_in_executor(None, lambda: send_alert_tool(parameters=args, player=self.ui))
+                result = r or "Done."
+
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
@@ -695,7 +1110,7 @@ class JarvisLive:
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
         return types.FunctionResponse(
-            id=fc.id, name=name,
+            id=fc_id, name=name,
             response={"result": result}
         )
 
@@ -866,16 +1281,24 @@ class JarvisLive:
 def main():
     ui = JarvisUI("face.png")
 
+    # Gold watcher daemon — checks price every 15 min, alerts on big moves.
+    from core.scheduler import GoldWatcher
+    gold_watcher = GoldWatcher(AUDIT, interval_seconds=900, alert_threshold_pct=0.3)
+    gold_watcher.start()
+    ui.write_log("DAEMON: gold watcher started (15 min interval)")
+
     def runner():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
-            print("\n🔴 Shutting down...")
+            print("\n[JARVIS] Shutting down...")
+            gold_watcher.stop()
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
+    gold_watcher.stop()
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,133 @@
+{
+  "_comment": "Orchestration metadata for MARK XXXIX tools (Tiers 2 & 4). Schemas live in main.py TOOL_DECLARATIONS; this file layers on WHO may call each tool and WHETHER it needs a human yes. 'agents' is an allowlist ([] = every agent). 'requires_confirmation' gates the call behind explicit human approval. 'destructive' marks irreversible actions for logging/UI emphasis.",
+  "send_message": {
+    "requires_confirmation": true,
+    "destructive": true,
+    "agents": [
+      "jarvis"
+    ]
+  },
+  "shutdown_jarvis": {
+    "requires_confirmation": true,
+    "destructive": true,
+    "agents": [
+      "jarvis"
+    ]
+  },
+  "game_updater": {
+    "requires_confirmation": true,
+    "destructive": false,
+    "agents": [
+      "jarvis"
+    ]
+  },
+  "file_controller": {
+    "requires_confirmation": false,
+    "destructive": true,
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "computer_settings": {
+    "requires_confirmation": false,
+    "destructive": true,
+    "agents": [
+      "jarvis"
+    ]
+  },
+  "desktop_control": {
+    "destructive": true,
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "dev_agent": {
+    "agents": [
+      "jarvis"
+    ]
+  },
+  "computer_control": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "open_app": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "web_search": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "weather_report": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "youtube_video": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "flight_finder": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "browser_control": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "code_helper": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "screen_process": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "reminder": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "weather": {
+    "agents": [
+      "jarvis",
+      "task"
+    ]
+  },
+  "tradingview": {
+    "agents": [
+      "jarvis",
+      "eva",
+      "tom"
+    ],
+    "destructive": false
+  },
+  "send_alert": {
+    "agents": [
+      "jarvis",
+      "eva",
+      "bobby"
+    ],
+    "destructive": false
+  }
+}

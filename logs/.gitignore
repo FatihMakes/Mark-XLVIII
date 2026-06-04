@@ -1,0 +1,4 @@
+# Runtime audit database — do not commit the black box.
+*.db
+*.db-journal
+*.db-wal

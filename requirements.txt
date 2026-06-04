@@ -1,6 +1,7 @@
 ﻿sounddevice
 google-genai
 google-generativeai
+ollama
 pillow
 requests
 beautifulsoup4
@@ -22,3 +23,5 @@ youtube-transcript-api
 pywinauto
 python-pptx
 pyqt6
+streamlit
+tradingview-ta
