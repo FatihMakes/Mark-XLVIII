@@ -121,5 +121,13 @@
       "tom"
     ],
     "destructive": false
+  },
+  "send_alert": {
+    "agents": [
+      "jarvis",
+      "eva",
+      "bobby"
+    ],
+    "destructive": false
   }
 }

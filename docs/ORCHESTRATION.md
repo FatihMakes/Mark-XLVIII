@@ -134,6 +134,32 @@ Role agents run on a **local** model by default; `ROLE_LLM_BACKEND` in `main.py`
   result in history; `RoleAgent` records it and `build_messages` reconstructs it in
   Ollama's shape. Without it, a local model re-calls the same tool to the iteration cap.
 
+## Telegram alerts
+
+`core/telegram.py` sends text messages to a configured Telegram chat via the Bot API.
+Used by the scheduler (Eva daemon) and by roles that want to push alerts (Bobby news
+alerts, Eva price alerts). To configure, add to `config/api_keys.json`:
+
+```json
+{"telegram": {"bot_token": "123456:ABC-DEF...", "chat_id": "your_chat_id"}}
+```
+
+The `send_alert` tool is scoped to `jarvis`, `eva`, and `bobby` in `config/tools.json`.
+
+## Gold watcher daemon
+
+`core/scheduler.py:GoldWatcher` runs in a background thread, started automatically in
+`main()`. Every 15 minutes (configurable) it:
+
+1. Fetches the live gold price via `tradingview_ta`
+2. Records a heartbeat in `audit.db` (visible on the dashboard)
+3. If price moved more than 0.3% since last check, sends a Telegram alert
+4. On strong signals (`STRONG_BUY`/`STRONG_SELL`) or big moves, optionally runs a full
+   Eva analysis for a richer read
+
+The daemon is failure-isolated — a crashed tick logs the error and schedules the next one.
+Stop it with `gold_watcher.stop()` on shutdown.
+
 ## Live market tool (TradingView)
 
 `core/tradingview.py` gives a role (or Jarvis) a live market read — price, the
@@ -204,8 +230,9 @@ mapping is tested without a browser.
 python -m unittest discover -s tests -t . -v
 ```
 
-Covers orchestration, roles, the local Ollama backend, the audit black box, and the
-dashboard data layer (75 tests, stdlib only — no Gemini, Ollama, Qt, or browser needed).
+Covers orchestration, roles, the local Ollama backend, the audit black box, the
+dashboard data layer, the Telegram adapter, the TradingView tool, and the gold watcher
+daemon (100 tests, stdlib only — no Gemini, Ollama, Qt, or browser needed).
 
 40 tests, stdlib only — they cover allowlist scoping, failure isolation, the
 confirmation gate, the bounded role loop, keyword routing, and the handoff lifecycle,

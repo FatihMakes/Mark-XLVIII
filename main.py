@@ -453,6 +453,21 @@ TOOL_DECLARATIONS = [
     }
 },
     {
+        "name": "send_alert",
+        "description": (
+            "Send a Telegram alert to the configured chat. Use for price alerts, "
+            "news alerts, or any notification that should reach the user's phone. "
+            "Does NOT replace send_message (which sends to specific contacts)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "message": {"type": "STRING", "description": "The alert text (Markdown supported)"},
+            },
+            "required": ["message"],
+        },
+    },
+    {
         "name": "tradingview",
         "description": (
             "Live market analysis from TradingView: current price, the BUY/SELL/NEUTRAL "
@@ -696,11 +711,13 @@ class JarvisLive:
         """
         ui = self.ui
         from core.tradingview import tradingview_tool
+        from core.telegram import send_alert_tool
         bindings = {
             "web_search":      lambda a, ctx: web_search_action(parameters=a, player=ui) or "Done.",
             "file_controller": lambda a, ctx: file_controller(parameters=a, player=ui) or "Done.",
             "browser_control": lambda a, ctx: browser_control(parameters=a, player=ui) or "Done.",
             "tradingview":     lambda a, ctx: tradingview_tool(parameters=a, player=ui),
+            "send_alert":      lambda a, ctx: send_alert_tool(parameters=a, player=ui),
         }
         for tool_name, handler in bindings.items():
             try:
@@ -1045,6 +1062,11 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: tradingview_tool(parameters=args, player=self.ui))
                 result = r or "Done."
 
+            elif name == "send_alert":
+                from core.telegram import send_alert_tool
+                r = await loop.run_in_executor(None, lambda: send_alert_tool(parameters=args, player=self.ui))
+                result = r or "Done."
+
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
@@ -1259,16 +1281,24 @@ class JarvisLive:
 def main():
     ui = JarvisUI("face.png")
 
+    # Gold watcher daemon — checks price every 15 min, alerts on big moves.
+    from core.scheduler import GoldWatcher
+    gold_watcher = GoldWatcher(AUDIT, interval_seconds=900, alert_threshold_pct=0.3)
+    gold_watcher.start()
+    ui.write_log("DAEMON: gold watcher started (15 min interval)")
+
     def runner():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
-            print("\n🔴 Shutting down...")
+            print("\n[JARVIS] Shutting down...")
+            gold_watcher.stop()
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
+    gold_watcher.stop()
 
 if __name__ == "__main__":
     main()

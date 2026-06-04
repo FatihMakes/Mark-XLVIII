@@ -55,7 +55,8 @@
       "tools": [
         "web_search",
         "file_controller",
-        "tradingview"
+        "tradingview",
+        "send_alert"
       ],
       "max_iterations": 5,
       "requires_confirmation": false,
@@ -84,7 +85,8 @@
       "tools": [
         "web_search",
         "browser_control",
-        "file_controller"
+        "file_controller",
+        "send_alert"
       ],
       "max_iterations": 5,
       "requires_confirmation": false,
