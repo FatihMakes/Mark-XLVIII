@@ -56,6 +56,29 @@ def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
     return results
 
 
+def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
+    """DDG news search — returns actual articles, not website homepages."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+
+    results = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.news(query, max_results=max_results):
+                results.append({
+                    "title":   r.get("title",  ""),
+                    "snippet": r.get("body",   ""),
+                    "url":     r.get("url",    ""),
+                    "source":  r.get("source", ""),
+                })
+    except Exception as e:
+        print(f"[WebSearch] ⚠️ DDG news() failed ({e}) — falling back to text search")
+        results = _ddg_search(query, max_results=max_results)
+    return results
+
+
 def _format_ddg(query: str, results: list[dict]) -> str:
     if not results:
         return f"No results found for: {query}"
@@ -65,6 +88,25 @@ def _format_ddg(query: str, results: list[dict]) -> str:
         if r.get("title"):   lines.append(f"{i}. {r['title']}")
         if r.get("snippet"): lines.append(f"   {r['snippet']}")
         if r.get("url"):     lines.append(f"   Source: {r['url']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _format_news(query: str, results: list[dict]) -> str:
+    if not results:
+        return f"No news found for: {query}"
+
+    lines = [f"Latest news: {query}\n"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "")
+        if not title:
+            continue
+        src = f"  [{r['source']}]" if r.get("source") else ""
+        lines.append(f"{i}. {title}{src}")
+        if r.get("snippet"):
+            lines.append(f"   {r['snippet'][:140]}")
+        if r.get("url"):
+            lines.append(f"   {r['url']}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -121,14 +163,52 @@ def _search(query: str) -> str:
 
 
 def _news(query: str) -> str:
-    """Latest news — forces recency in the query."""
-    news_query = f"latest news today: {query}" if query else "top world news today"
-    try:
-        return _gemini_search(news_query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ News Gemini failed ({e}) — DDG fallback...")
-        results = _ddg_search(news_query, max_results=8)
-        return _format_ddg(news_query, results)
+    """
+    Runs Gemini grounded search AND DDG news in parallel.
+    Returns whichever delivers a valid result first; cancels the other.
+    """
+    import threading
+
+    gemini_query = f"latest news today: {query}" if query else "top world news today"
+    ddg_query    = query if query else "world news today"
+
+    result_box  = [None]   # first valid result lands here
+    lock        = threading.Lock()
+    done_evt    = threading.Event()
+    failures    = [0]
+
+    def _store(r: str) -> None:
+        if r and len(r) > 60:
+            with lock:
+                if result_box[0] is None:
+                    result_box[0] = r
+            done_evt.set()
+        else:
+            with lock:
+                failures[0] += 1
+                if failures[0] >= 2:   # both failed — unblock caller
+                    done_evt.set()
+
+    def _try_gemini():
+        try:
+            _store(_gemini_search(gemini_query))
+        except Exception as e:
+            print(f"[WebSearch] ⚠️ Gemini news failed ({e})")
+            _store("")
+
+    def _try_ddg():
+        try:
+            results = _ddg_news(ddg_query, max_results=8)
+            _store(_format_news(ddg_query, results))
+        except Exception as e:
+            print(f"[WebSearch] ⚠️ DDG news failed ({e})")
+            _store("")
+
+    threading.Thread(target=_try_gemini, daemon=True).start()
+    threading.Thread(target=_try_ddg,    daemon=True).start()
+
+    done_evt.wait(timeout=10.0)
+    return result_box[0] or f"No news found for: {query}"
 
 
 def _research(query: str) -> str:

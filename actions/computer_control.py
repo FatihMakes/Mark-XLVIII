@@ -6,6 +6,11 @@ import re
 import string
 import subprocess
 import sys
+
+if platform.system() == "Windows":
+    _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
+else:
+    _WIN_HIDE: dict = {}
 import time
 import random
 from pathlib import Path
@@ -258,7 +263,7 @@ def _focus_window(title: str) -> str:
             script = f'(New-Object -ComObject WScript.Shell).AppActivate("{title}")'
             subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, timeout=5,
+                capture_output=True, timeout=5, **_WIN_HIDE,
             )
             time.sleep(0.3)
             return f"Focused window: {title}"

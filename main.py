@@ -1,6 +1,24 @@
+import platform as _platform
+import subprocess as _subprocess
+
+# ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
+# This patches Popen itself, so no per-file flag is needed anywhere.
+if _platform.system() == "Windows":
+    _OrigPopen = _subprocess.Popen
+
+    class _Popen(_OrigPopen):
+        def __init__(self, args, **kw):
+            kw["creationflags"] = kw.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
+            kw.pop("startupinfo", None)   # drop any stale/shared STARTUPINFO
+            super().__init__(args, **kw)
+
+    _subprocess.Popen = _Popen
+# ─────────────────────────────────────────────────────────────────────────────
+
 import asyncio
 import re
 import threading
+import time
 import json
 import sys
 import traceback
@@ -22,7 +40,7 @@ from actions.weather_report    import weather_action
 from actions.send_message      import send_message
 from actions.reminder          import reminder
 from actions.computer_settings import computer_settings
-from actions.screen_processor  import screen_process
+from actions.screen_processor  import _capture_camera, _capture_screen
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
 from actions.browser_control   import browser_control
@@ -33,6 +51,7 @@ from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
+from actions.proactive         import ProactiveEngine
 
 
 def get_base_dir():
@@ -181,11 +200,12 @@ TOOL_DECLARATIONS = [
     {
         "name": "screen_process",
         "description": (
-            "Captures and analyzes the screen or webcam image. "
+            "Captures the screen or webcam image and lets you analyze it. "
             "MUST be called when user asks what is on screen, what you see, "
-            "analyze my screen, look at camera, etc. "
+            "look at camera, analyze my screen, etc. "
             "You have NO visual ability without this tool. "
-            "After calling this tool, stay SILENT — the vision module speaks directly."
+            "After the image is captured it is sent directly to you — describe what you see and answer the user's question. "
+            "When using camera: the live view stays open until user says close it or calls close_camera."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -195,6 +215,15 @@ TOOL_DECLARATIONS = [
             },
             "required": ["text"]
         }
+    },
+    {
+        "name": "close_camera",
+        "description": (
+            "Closes the live camera view shown on screen. "
+            "Call when user says: close camera, stop camera, turn off camera, "
+            "kamerayı kapat, kapat, creepy, etc."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}, "required": []}
     },
     {
         "name": "computer_settings",
@@ -491,19 +520,28 @@ class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
-        self.session        = None
-        self.audio_in_queue = None
-        self.out_queue      = None
-        self._loop          = None
-        self._is_speaking   = False
-        self._speaking_lock = threading.Lock()
-        self._phone_active  = False   # True while phone mic is streaming; pauses PC mic
-        self.ui.on_text_command  = self._on_text_command
+        self.session              = None
+        self.audio_in_queue       = None
+        self.out_queue            = None
+        self._loop                = None
+        self._is_speaking         = False
+        self._speaking_lock       = threading.Lock()
+        self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
+        self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
+        self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
+        self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
+        self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
+        self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
+        self._interrupted          = False   # True while draining audio after user interrupt
+        self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
+        self.ui.on_interrupt      = self.interrupt
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
-        self._briefing_sent = False          # morning briefing fires once per process
-        self._sys_monitor   = SystemMonitor()  # persistent cooldown state
+        self._briefing_sent    = False          # morning briefing fires once per process
+        self._sys_monitor      = SystemMonitor()  # persistent cooldown state
+        self._proactive        = ProactiveEngine()
+        self._last_user_speech = time.monotonic()  # updated on every user utterance
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -536,6 +574,25 @@ class JarvisLive:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
+
+    def interrupt(self) -> None:
+        """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
+        self._interrupted = True
+        q = self.audio_in_queue
+        if q:
+            drained = 0
+            while True:
+                try:
+                    q.get_nowait()
+                    drained += 1
+                except Exception:
+                    break
+            if drained:
+                print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+        self.set_speaking(False)
+        if self._turn_done_event:
+            self._turn_done_event.clear()
+        self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -643,13 +700,40 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "screen_process":
-                threading.Thread(
-                    target=screen_process,
-                    kwargs={"parameters": args, "response": None,
-                            "player": self.ui, "session_memory": None},
-                    daemon=True
-                ).start()
-                result = "Vision module activated. Stay completely silent — vision module will speak directly."
+                import time as _t_mod
+                _now = _t_mod.monotonic()
+                _cooldown = 4.0  # seconds — covers echo window after speaking ends
+                if self._vision_busy or (_now - self._vision_last_time) < _cooldown:
+                    _wait = max(0, _cooldown - (_now - self._vision_last_time))
+                    print(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
+                    result = "Vision is still processing the previous request. I will not call this again."
+                else:
+                    self._vision_busy      = True
+                    self._vision_last_time = _now
+                    angle     = args.get("angle", "screen").lower()
+                    user_text = args.get("text", "What do you see?")
+                    if angle == "camera":
+                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
+                        self.ui.start_camera_stream()
+                        self._vision_cam_active = True
+                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                        _stall = "camera"
+                    else:
+                        img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
+                        print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
+                        _stall = "screen"
+                    self._pending_vision = (img_b, mime_t, user_text, angle)
+                    result = (
+                        f"[VISION_ACTIVE] {_stall.capitalize()} captured. "
+                        f"Immediately say ONE natural sentence in the user's language "
+                        f"(e.g. 'Looking at your {_stall} now, sir' / "
+                        f"'{'Kameraya' if _stall == 'camera' else 'Ekrana'} bakıyorum efendim'). "
+                        f"Do NOT describe or guess content — the actual image arrives in the NEXT message."
+                    )
+
+            elif name == "close_camera":
+                self.ui.stop_camera_stream()
+                result = "Camera closed."
 
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
@@ -670,12 +754,12 @@ class JarvisLive:
             elif name == "web_search":
                 r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
                 result = r or "Done."
-                # Mirror substantial results to the on-screen content panel
-                if r and len(r) > 120:
-                    mode  = args.get("mode", "search").upper()
-                    query = args.get("query") or ", ".join(args.get("items", []))
-                    label = f"{mode} — {query[:38]}" if query else mode
-                    self.ui.show_content(label, r)
+                # Mirror results to the on-screen content panel
+                _mode = args.get("mode", "search")
+                if r and not r.startswith("No results") and not r.startswith("Search failed"):
+                    _query = args.get("query") or ", ".join(args.get("items", []))
+                    _label = f"{_mode.upper()} — {_query[:38]}" if _query else _mode.upper()
+                    self.ui.show_content(_label, r)
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
@@ -770,26 +854,43 @@ class JarvisLive:
                 async for response in self.session.receive():
 
                     if response.data:
-                        if self._turn_done_event and self._turn_done_event.is_set():
-                            self._turn_done_event.clear()
-                        self.audio_in_queue.put_nowait(response.data)
+                        if self._interrupted:
+                            pass  # discard: interrupted
+                        else:
+                            if self._turn_done_event and self._turn_done_event.is_set():
+                                self._turn_done_event.clear()
+                            # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
+                            # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
+                            _audio_data = response.data
+                            _SLICE = 2400
+                            for _i in range(0, len(_audio_data), _SLICE):
+                                self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
 
                     if response.server_content:
                         sc = response.server_content
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
-                            if txt:
+                            if txt and txt != (out_buf[-1] if out_buf else ""):
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
                                 in_buf.append(txt)
+                                self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
+
+                            # If this turn_complete ends an interrupted response, clear the
+                            # flag and skip all further processing for that turn.
+                            if self._interrupted:
+                                self._interrupted = False
+                                in_buf  = []
+                                out_buf = []
+                                continue
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
@@ -812,6 +913,37 @@ class JarvisLive:
                                         "ts": datetime.now().isoformat(),
                                     }))
                             out_buf = []
+
+                            # Vision injection: model finished tool-response turn → now send the image
+                            if self._pending_vision and self.session:
+                                import base64 as _b64
+                                img_b, mime_t, question, angle = self._pending_vision
+                                self._pending_vision = None
+                                b64 = _b64.b64encode(img_b).decode("ascii")
+                                print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
+                                await self.session.send_client_content(
+                                    turns={"parts": [
+                                        {"inline_data": {"mime_type": mime_t, "data": b64}},
+                                        {"text": question},
+                                    ]},
+                                    turn_complete=True,
+                                )
+                                # Mark next turn_complete behaviour depending on angle
+                                if self._vision_cam_active:
+                                    # Camera: keep busy until JARVIS finishes speaking the answer
+                                    self._vision_cam_active    = False
+                                    self._vision_close_pending = True
+                                else:
+                                    # Screen-only: no camera to close; release busy flag now
+                                    self._vision_busy = False
+                            elif self._vision_close_pending:
+                                # This turn_complete IS the vision answer — close camera + release busy flag
+                                self._vision_close_pending = False
+                                self._vision_busy = False
+                                async def _cam_close():
+                                    await asyncio.sleep(2.0)
+                                    self.ui.stop_camera_stream()
+                                asyncio.create_task(_cam_close())
 
                     if response.tool_call:
                         fn_responses = []
@@ -855,7 +987,10 @@ class JarvisLive:
                         self._turn_done_event.clear()
                     continue
                 self.set_speaking(True)
-                await asyncio.to_thread(stream.write, chunk)
+                try:
+                    await asyncio.to_thread(stream.write, chunk)
+                except (RuntimeError, asyncio.CancelledError):
+                    break   # executor shutting down — exit cleanly
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
@@ -890,21 +1025,16 @@ class JarvisLive:
         from datetime import datetime
         time_str = datetime.now().strftime("%H:%M")
 
-        # ── Phase 1: instant greeting — zero data needed ──────────────────────
-        p1_lines = [
-            "[STARTUP_GREETING] Greet the user immediately. Keep it to 1-2 short sentences.",
-            f"Current time: {time_str}.",
-            "- Say hello and mention the time naturally.",
-            "- Say you are checking today's headlines and will share them in a moment.",
-            "- Do NOT call any tools. Do NOT say [STARTUP_GREETING].",
-            "- Respond in "
-            + (f"language: {lang}." if lang else "the user's language (default: English)."),
-        ]
-        if name:
-            p1_lines.append(f"- Address the user as {name}.")
+        # ── Phase 1: instant greeting — one simple sentence ──────────────────
+        lang_clause = f" Respond in {lang}." if lang else ""
+        name_clause = f" Address the user as {name}." if name else ""
+        p1 = (
+            f"Greet the user, mention it is {time_str}, and say you are fetching today's news headlines now. "
+            f"One short sentence only. Do not call any tools.{lang_clause}{name_clause}"
+        )
 
         await self.session.send_client_content(
-            turns={"parts": [{"text": '\n'.join(p1_lines)}]},
+            turns={"parts": [{"text": p1}]},
             turn_complete=True,
         )
         self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
@@ -920,74 +1050,27 @@ class JarvisLive:
 
     async def _briefing_news_phase(self, lang: str) -> None:
         """
-        Fetches headlines (DDG → Gemini fallback), shows them on screen,
-        then injects a short 2-headline summary into the Live session.
-        Waits enough time for the phase-1 greeting to finish playing first.
+        Sends phase-2 (news) to Gemini ~1.5 s after phase-1 is dispatched so
+        Gemini starts working on it while phase-1 audio is still playing.
         """
-        from actions.web_search import _ddg_search, _gemini_headlines
+        lang_str = f" Respond in {lang}." if lang else ""
 
-        fetch_start           = asyncio.get_event_loop().time()
-        headlines: list[str]  = []
-        full_news             = ""
-
-        # 1) DDG — ~0.6 s when available
-        try:
-            results = await asyncio.wait_for(
-                asyncio.to_thread(_ddg_search, "world news today", 6),
-                timeout=4.0,
-            )
-            if results:
-                headlines = [r["title"] for r in results if r.get("title")][:6]
-                full_news = "\n\n".join(
-                    f"• {r.get('title','')}\n  {r.get('snippet','')}\n  {r.get('url','')}"
-                    for r in results
-                )
-        except Exception as e:
-            print(f"[Briefing] DDG: {e}")
-
-        # 2) Gemini grounded search — reliable fallback
-        if not headlines:
-            try:
-                headlines, full_news = await asyncio.wait_for(
-                    asyncio.to_thread(_gemini_headlines, 5),
-                    timeout=8.0,
-                )
-            except Exception as e:
-                print(f"[Briefing] Gemini headlines: {e}")
-
-        # Show full list on screen immediately when data arrives
-        if full_news:
-            self.ui.show_content("NEWS — latest headlines", full_news)
-
-        if not headlines or not self.session:
-            return
-
-        # Ensure the phase-1 greeting (≈ 3 s of speech) has finished before we speak again
-        elapsed       = asyncio.get_event_loop().time() - fetch_start
-        wait_more     = max(0.0, 3.5 - elapsed)
-        if wait_more > 0:
-            await asyncio.sleep(wait_more)
+        # 1.5 s is enough for Gemini to finish generating phase-1 audio on its
+        # side (turn_complete) while the greeting is still being played locally.
+        await asyncio.sleep(1.5)
 
         if not self.session:
             return
 
-        headlines_text = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
-        p2_lines = [
-            "[BRIEFING_NEWS] Today's headlines are already displayed on screen.",
-            "Data:",
-            headlines_text,
-            "",
-            "Voice rules:",
-            "- Mention ONLY 2 headlines — one short sentence each.",
-            "- Tell the user the full list is visible on screen.",
-            "- Ask if they need anything.",
-            "- Do NOT say [BRIEFING_NEWS].",
-            "- Respond in "
-            + (f"language: {lang}." if lang else "the user's language."),
-        ]
+        p2 = (
+            "[BRIEFING] Call web_search with mode='news' and query='top world news today' "
+            "to find actual recent news articles with real event headlines (not just website names). "
+            "After the search, say ONE specific news event from the results in one sentence, "
+            f"then say the full list is displayed on screen.{lang_str}"
+        )
 
         await self.session.send_client_content(
-            turns={"parts": [{"text": '\n'.join(p2_lines)}]},
+            turns={"parts": [{"text": p2}]},
             turn_complete=True,
         )
         self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
@@ -1007,6 +1090,41 @@ class JarvisLive:
                     )
                 except Exception as e:
                     print(f"[Monitor] ⚠️ Could not send alert: {e}")
+
+    # ── Proactive mode ──────────────────────────────────────────────────────────
+
+    async def _run_proactive_mode(self) -> None:
+        """
+        Background task: periodically checks if the user has been silent long enough,
+        then hands time + memory context to Gemini so it can decide what (if anything)
+        to say proactively. No hardcoded rules — Gemini makes the call.
+        """
+        while True:
+            await asyncio.sleep(60)   # evaluate once per minute
+
+            if not self.session:
+                continue
+
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking:
+                continue
+
+            if not self._proactive.should_trigger(self._last_user_speech):
+                continue
+
+            self._proactive.mark_triggered()
+
+            try:
+                memory = await asyncio.to_thread(load_memory)
+                prompt = self._proactive.build_prompt(memory)
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": prompt}]},
+                    turn_complete=True,
+                )
+                self.ui.write_log("SYS: Proactive check-in.")
+            except Exception as e:
+                print(f"[Proactive] ⚠️ {e}")
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
@@ -1067,11 +1185,6 @@ class JarvisLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
 
-        client = genai.Client(
-            api_key=_get_api_key(),
-            http_options={"api_version": "v1beta"}
-        )
-
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
             from dashboard.server import DashboardServer
@@ -1090,6 +1203,12 @@ class JarvisLive:
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
+                # Fresh client on every reconnect — avoids stale HTTP session state
+                client = genai.Client(
+                    api_key=_get_api_key(),
+                    http_options={"api_version": "v1beta"}
+                )
+
                 async with (
                     client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
                     asyncio.TaskGroup() as tg,
@@ -1098,6 +1217,14 @@ class JarvisLive:
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
+
+                    # Reset transient state that must not carry over from a previous session
+                    self._pending_vision       = None
+                    self._vision_cam_active    = False
+                    self._vision_close_pending = False
+                    self._vision_busy          = False
+                    self._vision_last_time     = 0.0
+                    self._interrupted          = False
 
                     print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING")
@@ -1111,6 +1238,7 @@ class JarvisLive:
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
+                    tg.create_task(self._run_proactive_mode())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
@@ -1119,9 +1247,45 @@ class JarvisLive:
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 
-            except Exception as e:
-                print(f"[JARVIS] Error: {e}")
+            except KeyboardInterrupt:
+                raise
+            except SystemExit:
+                raise
+            except BaseException as e:
+                # Catches both Exception and BaseExceptionGroup (Python 3.11+
+                # TaskGroup raises BaseExceptionGroup when tasks are cancelled
+                # externally, which `except Exception` would miss, letting the
+                # exception escape the while-loop and causing asyncio.run() to
+                # start shutdown — resulting in "executor after shutdown" errors).
+                err_str = str(e)
+                print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
+
+                # Invalid API key — stop hammering the API, prompt re-configuration
+                if "API key not valid" in err_str or "1007" in err_str:
+                    self.ui.write_log("ERR: API key invalid — please re-enter your key.")
+                    self.ui.set_state("SLEEPING")
+                    self.ui.prompt_reconfig()
+                    while not self.ui._win._ready:
+                        await asyncio.sleep(1)
+                    print("[JARVIS] New API key saved — reconnecting...")
+                    _conn_backoff = 3
+                    continue
+
+                # Network / timeout errors — log clearly and back off
+                is_net_err = any(k in err_str for k in (
+                    "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
+                    "ConnectionRefusedError", "OSError", "Cannot connect",
+                ))
+                if is_net_err:
+                    _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
+                    self._conn_backoff = _conn_backoff
+                    self.ui.write_log(
+                        f"NET: Bağlantı kurulamadı — {_conn_backoff}s sonra tekrar deneniyor. "
+                        "(VPN gerekiyor olabilir)"
+                    )
+                else:
+                    self._conn_backoff = 3
             finally:
                 self.session = None
 
@@ -1131,8 +1295,9 @@ class JarvisLive:
             if self._dashboard:
                 await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
 
-            print("[JARVIS] Reconnecting in 3s...")
-            await asyncio.sleep(3)
+            delay = getattr(self, "_conn_backoff", 3)
+            print(f"[JARVIS] Reconnecting in {delay}s...")
+            await asyncio.sleep(delay)
 
 def main():
     ui = JarvisUI("face.png")

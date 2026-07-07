@@ -1,10 +1,16 @@
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+_CNW: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW}
+    if platform.system() == "Windows" else {}
+)
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -177,7 +183,7 @@ def _schedule_windows(target_dt: datetime, task_name: str,
 
     result = subprocess.run(
         ["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, **_CNW,
     )
 
     try:

@@ -23,6 +23,11 @@ except ImportError:
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
+if _OS == "Windows":
+    _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
+else:
+    _WIN_HIDE: dict = {}
+
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -133,7 +138,7 @@ def brightness_up():
                  "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
                  ".WmiSetBrightness(1, [math]::Min(100, "
                  "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness).CurrentBrightness + 10))"],
-                capture_output=True, timeout=5
+                capture_output=True, timeout=5, **_WIN_HIDE
             )
         except Exception as e:
             print(f"[Settings] Brightness up failed on Windows: {e}")
@@ -162,7 +167,7 @@ def brightness_down():
                  "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
                  ".WmiSetBrightness(1, [math]::Max(0, "
                  "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness).CurrentBrightness - 10))"],
-                capture_output=True, timeout=5
+                capture_output=True, timeout=5, **_WIN_HIDE
             )
         except Exception as e:
             print(f"[Settings] Brightness down failed on Windows: {e}")
@@ -470,7 +475,7 @@ def toggle_wifi():
                  "$adapter = Get-NetAdapter | Where-Object {$_.PhysicalMediaType -eq 'Native 802.11'};"
                  "if ($adapter.Status -eq 'Up') { Disable-NetAdapter -Name $adapter.Name -Confirm:$false }"
                  "else { Enable-NetAdapter -Name $adapter.Name -Confirm:$false }"],
-                capture_output=True, timeout=10
+                capture_output=True, timeout=10, **_WIN_HIDE
             )
         except Exception as e:
             print(f"[Settings] toggle_wifi Windows failed: {e}")
@@ -484,7 +489,7 @@ def toggle_wifi():
 
 def restart_computer():
     if _OS == "Windows":
-        subprocess.run(["shutdown", "/r", "/t", "10"], capture_output=True)
+        subprocess.run(["shutdown", "/r", "/t", "10"], capture_output=True, **_WIN_HIDE)
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e",
             'tell application "System Events" to restart'],

@@ -77,17 +77,19 @@ _CHANNELS           = 1
 _RECEIVE_SAMPLE_RATE = 24_000
 _CHUNK_SIZE         = 1_024
 
-_IMG_MAX_W = 640
-_IMG_MAX_H = 360
-_JPEG_Q    = 60
+_IMG_MAX_W = 1280
+_IMG_MAX_H = 720
+_JPEG_Q    = 82
 
 _SYSTEM_PROMPT = (
-    "You are JARVIS, an advanced AI assistant. "
-    "Analyze the provided image with precision and intelligence. "
-    "Be concise and direct — maximum two sentences unless the user's question "
-    "requires more detail. "
-    "Address the user respectfully. "
-    "Always call the appropriate tool; never simulate results."
+    "You are JARVIS, Tony Stark's AI assistant. "
+    "You are given an image from either the user's screen or their webcam. "
+    "Analyze what you see with detail and intelligence. "
+    "Describe objects, text, people, components, and their context clearly. "
+    "For technical questions (circuits, code, hardware) give specific, expert answers. "
+    "Be concise — 2-4 sentences — unless the question demands more detail. "
+    "Speak directly to the user ('I can see...', 'You have...'). "
+    "Address the user as 'sir' depending on the language they used."
 )
 
 
@@ -318,6 +320,7 @@ class _VisionSession:
                 print(f"[Vision] 📤 Sent {len(image_bytes):,} bytes — '{user_text[:60]}'")
             except Exception as e:
                 print(f"[Vision] ⚠️  Send error: {e}")
+                raise  # propagate to TaskGroup → triggers session reconnect
 
     async def _recv_loop(self) -> None:
         transcript: list[str] = []
@@ -342,6 +345,15 @@ class _VisionSession:
                             self._player.write_log(f"Jarvis: {full}")
                             print(f"[Vision] 💬 {full}")
                     transcript = []
+                    # Auto-close camera ~2s after JARVIS finishes speaking
+                    if self._player and hasattr(self._player, "stop_camera_stream"):
+                        async def _deferred_close():
+                            await asyncio.sleep(2.0)
+                            try:
+                                self._player.stop_camera_stream()
+                            except Exception:
+                                pass
+                        asyncio.create_task(_deferred_close())
 
         except Exception as e:
             print(f"[Vision] ⚠️  Recv error: {e}")
@@ -408,6 +420,16 @@ def screen_process(
         if angle == "camera":
             image_bytes, mime_type = _capture_camera()
             print(f"[Vision] 📷 Camera: {len(image_bytes):,} bytes")
+            if player and hasattr(player, "start_camera_stream"):
+                try:
+                    player.start_camera_stream()
+                except Exception as _e:
+                    print(f"[Vision] ⚠️  Camera stream failed: {_e}")
+            elif player and hasattr(player, "show_camera_frame"):
+                try:
+                    player.show_camera_frame(image_bytes)
+                except Exception as _e:
+                    print(f"[Vision] ⚠️  Camera preview failed: {_e}")
         else:
             image_bytes, mime_type = _capture_screen()
             print(f"[Vision] 🖥️  Screen: {len(image_bytes):,} bytes")

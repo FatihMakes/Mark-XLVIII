@@ -13,6 +13,11 @@ from pathlib import Path
 
 import psutil
 
+if platform.system() == "Windows":
+    _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
+else:
+    _WIN_HIDE: dict = {}
+
 from PyQt6.QtCore import (
     QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, Qt,
     QTimer, QUrl, pyqtSignal,
@@ -24,8 +29,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
-    QVBoxLayout, QWidget, QProgressBar,
+    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
 
 def _base_dir() -> Path:
@@ -71,6 +76,51 @@ class C:
 
 def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
+
+
+# ── Windows GPU via NVML DLL (no subprocess, no console window) ──────────────
+_nvml_lib: object = None   # cached ctypes DLL
+_nvml_ok:  object = None   # None=untested, True=works, False=unavailable
+
+
+def _nvml_gpu_windows() -> float:
+    """Return NVIDIA GPU utilisation % using nvml.dll directly — zero subprocess."""
+    global _nvml_lib, _nvml_ok
+    if _nvml_ok is False:
+        return -1.0
+    try:
+        import ctypes
+
+        class _Util(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        if _nvml_lib is None:
+            for dll_name in ("nvml", r"C:\Windows\System32\nvml.dll"):
+                try:
+                    lib = ctypes.WinDLL(dll_name)
+                    lib.nvmlInit_v2()
+                    _nvml_lib = lib
+                    break
+                except Exception:
+                    continue
+
+        if _nvml_lib is None:
+            import pynvml  # type: ignore
+            pynvml.nvmlInit()
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            _nvml_ok = True
+            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+
+        dev = ctypes.c_void_p()
+        _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
+        util = _Util()
+        _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(util))
+        _nvml_ok = True
+        return float(util.gpu)
+    except Exception:
+        _nvml_ok = False
+        return -1.0
+
 
 class _SysMetrics:
     def __init__(self):
@@ -122,112 +172,65 @@ class _SysMetrics:
             self.tmp = tmp
 
     def _get_gpu(self) -> float:
-        # NVIDIA
+        # pynvml — subprocess-free, works on all platforms if installed
         try:
-            r = subprocess.run(
-                ["nvidia-smi", "--query-gpu=utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2
-            )
-            if r.returncode == 0:
-                vals = [float(v.strip()) for v in r.stdout.strip().split("\n") if v.strip()]
-                if vals:
-                    return sum(vals) / len(vals)
+            import pynvml  # type: ignore
+            pynvml.nvmlInit()
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
         except Exception:
             pass
 
-        # AMD (Linux)
-        if _OS == "Linux":
-            try:
-                r = subprocess.run(
-                    ["rocm-smi", "--showuse", "--csv"],
-                    capture_output=True, text=True, timeout=2
-                )
-                if r.returncode == 0:
-                    for line in r.stdout.strip().split("\n"):
-                        parts = line.split(",")
-                        if len(parts) >= 2:
-                            try:
-                                return float(parts[1].strip().replace("%", ""))
-                            except ValueError:
-                                pass
-            except Exception:
-                pass
+        # Windows: nvml.dll via ctypes (already cached in _nvml_gpu_windows)
+        if _OS == "Windows":
+            return _nvml_gpu_windows()
 
-            # Intel GPU (Linux)
-            try:
-                r = subprocess.run(
-                    ["intel_gpu_top", "-J", "-s", "500"],
-                    capture_output=True, text=True, timeout=1
-                )
-                if r.returncode == 0 and "Render/3D" in r.stdout:
-                    import re
-                    m = re.search(r'"busy":\s*([\d.]+)', r.stdout)
-                    if m:
-                        return float(m.group(1))
-            except Exception:
-                pass
+        # Linux / macOS: libnvidia-ml shared lib via ctypes
+        try:
+            import ctypes
+            _lib = "libnvidia-ml.so.1" if _OS == "Linux" else "libnvidia-ml.dylib"
 
-        # macOS — powermetrics (GPU Engine)
-        if _OS == "Darwin":
-            try:
-                r = subprocess.run(
-                    ["sudo", "-n", "powermetrics", "-n", "1", "-i", "500",
-                     "--samplers", "gpu_power"],
-                    capture_output=True, text=True, timeout=2
-                )
-                if r.returncode == 0 and "GPU" in r.stdout:
-                    import re
-                    m = re.search(r'GPU\s+Active:\s+([\d.]+)%', r.stdout)
-                    if m:
-                        return float(m.group(1))
-            except Exception:
-                pass
+            class _Util(ctypes.Structure):
+                _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
-        return -1.0
+            nv = ctypes.CDLL(_lib)
+            nv.nvmlInit_v2()
+            dev = ctypes.c_void_p()
+            nv.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
+            u = _Util()
+            nv.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u))
+            return float(u.gpu)
+        except Exception:
+            pass
+
+        return -1.0   # N/A — zero subprocess on all platforms
 
     def _get_temp(self) -> float:
+        # psutil — works on Linux; occasionally Windows with driver support
         try:
             temps = psutil.sensors_temperatures()
-            candidates = ["coretemp", "k10temp", "cpu_thermal", "acpitz",
-                          "cpu-thermal", "zenpower", "it8688"]
-            for name in candidates:
-                if name in temps:
-                    entries = temps[name]
-                    if entries:
-                        return entries[0].current
+            for name in ["coretemp", "k10temp", "cpu_thermal", "acpitz",
+                         "cpu-thermal", "zenpower", "it8688"]:
+                if name in temps and temps[name]:
+                    return temps[name][0].current
             for entries in temps.values():
                 if entries:
                     return entries[0].current
         except Exception:
             pass
-        if _OS == "Darwin":
-            try:
-                r = subprocess.run(
-                    ["osx-cpu-temp"], capture_output=True, text=True, timeout=2
-                )
-                if r.returncode == 0:
-                    import re
-                    m = re.search(r"([\d.]+)", r.stdout)
-                    if m:
-                        return float(m.group(1))
-            except Exception:
-                pass
 
+        # Windows: wmi module (pure Python COM, zero subprocess)
         if _OS == "Windows":
             try:
-                r = subprocess.run(
-                    ["powershell", "-Command",
-                     "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi).CurrentTemperature"],
-                    capture_output=True, text=True, timeout=3
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    raw = float(r.stdout.strip().split("\n")[0])
-                    return (raw / 10.0) - 273.15
+                import wmi  # type: ignore
+                w = wmi.WMI(namespace="root/wmi")
+                tz = w.MSAcpi_ThermalZoneTemperature()
+                if tz:
+                    return (tz[0].CurrentTemperature / 10.0) - 273.15
             except Exception:
                 pass
 
-        return -1.0
+        return -1.0   # N/A — zero subprocess on all platforms
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -855,6 +858,73 @@ class _DropCanvas(QWidget):
             z.mousePressEvent(e)
 
 
+class _CameraPreview(QWidget):
+    """Floating overlay that briefly shows what the camera captured."""
+
+    _W, _H = 244, 188
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            _CameraPreview {{
+                background: rgba(0, 6, 10, 242);
+                border: 1px solid {C.PRI};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._W)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 5, 6, 6)
+        lay.setSpacing(4)
+
+        hdr = QHBoxLayout()
+        title = QLabel("◈  VISUAL INPUT")
+        title.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(16, 16)
+        close_btn.setFont(QFont("Courier New", 8))
+        close_btn.setStyleSheet(
+            f"color: {C.TEXT_DIM}; background: transparent; border: none;"
+        )
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.hide)
+        hdr.addWidget(close_btn)
+        lay.addLayout(hdr)
+
+        self._img_lbl = QLabel()
+        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_lbl.setStyleSheet("background: transparent;")
+        lay.addWidget(self._img_lbl)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+
+        self.hide()
+
+    def show_frame(self, img_bytes: bytes) -> None:
+        px = QPixmap()
+        px.loadFromData(img_bytes)
+        if not px.isNull():
+            max_w = self._W - 12
+            scaled = px.scaled(
+                max_w, 160,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._img_lbl.setPixmap(scaled)
+            self._img_lbl.setFixedSize(scaled.width(), scaled.height())
+            self.adjustSize()
+        self.show()
+        self.raise_()
+        self._timer.start(6_000)   # auto-dismiss after 6 s
+
+
 class SetupOverlay(QWidget):
     done = pyqtSignal(str, str)
 
@@ -1216,10 +1286,15 @@ class MainWindow(QMainWindow):
     _log_sig     = pyqtSignal(str)
     _state_sig   = pyqtSignal(str)
     _content_sig = pyqtSignal(str, str)   # (title, text) — thread-safe content display
+    _reconfig_sig = pyqtSignal()          # trigger setup overlay from any thread
+    _camera_sig     = pyqtSignal(bytes)   # show camera frame preview (small overlay)
+    _cam_stream_sig = pyqtSignal(bool)   # True=start live stream, False=stop
+    _cam_frame_sig  = pyqtSignal(bytes)  # live camera frame → HUD area
 
     def __init__(self, face_path: str):
         super().__init__()
-        self.setWindowTitle("J.A.R.V.I.S — MARK XLVII")
+        self._face_path = face_path
+        self.setWindowTitle("J.A.R.V.I.S — MARK XLVIII")
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -1229,9 +1304,10 @@ class MainWindow(QMainWindow):
             (screen.height() - _DEFAULT_H) // 2,
         )
 
-        self.on_text_command  = None
+        self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
-        self._muted           = False
+        self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
+        self._muted            = False
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
 
@@ -1251,18 +1327,66 @@ class MainWindow(QMainWindow):
         self._left_panel = self._build_left_panel()
         body.addWidget(self._left_panel, stretch=0)
 
-        # Center column: HUD on top + content panel below
-        _center = QWidget()
-        _center.setStyleSheet(f"background: {C.BG};")
-        _center_lay = QVBoxLayout(_center)
-        _center_lay.setContentsMargins(0, 0, 0, 0)
-        _center_lay.setSpacing(0)
+        # Center column: HUD + resizable content panel via QSplitter
         self.hud = HudCanvas(face_path)
         self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        _center_lay.addWidget(self.hud, stretch=1)
         self._content_panel = self._build_content_panel()
-        _center_lay.addWidget(self._content_panel)
-        body.addWidget(_center, stretch=5)
+
+        # Live camera container — replaces HUD when camera stream is active
+        _cam_cont = QWidget()
+        _cam_cont.setStyleSheet("background: #000308;")
+        _cam_v = QVBoxLayout(_cam_cont)
+        _cam_v.setContentsMargins(0, 0, 0, 0)
+        _cam_v.setSpacing(0)
+        _cam_hdr = QHBoxLayout()
+        _cam_hdr.setContentsMargins(8, 5, 8, 5)
+        _cam_title = QLabel("◈  CAMERA FEED")
+        _cam_title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        _cam_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        _cam_hdr.addWidget(_cam_title)
+        _cam_hdr.addStretch()
+        _cam_x = QPushButton("✕  CLOSE")
+        _cam_x.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        _cam_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        _cam_x.setStyleSheet(f"""
+            QPushButton {{
+                color: {C.TEXT_DIM}; background: transparent;
+                border: none; padding: 2px 6px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; }}
+        """)
+        _cam_x.clicked.connect(self.stop_camera_stream)
+        _cam_hdr.addWidget(_cam_x)
+        _cam_v.addLayout(_cam_hdr)
+        self._cam_live_lbl = QLabel()
+        self._cam_live_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cam_live_lbl.setStyleSheet("background: transparent;")
+        self._cam_live_lbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        _cam_v.addWidget(self._cam_live_lbl, stretch=1)
+
+        # Stack: 0 = animated HUD, 1 = live camera
+        self._hud_cam_stack = QStackedWidget()
+        self._hud_cam_stack.addWidget(self.hud)
+        self._hud_cam_stack.addWidget(_cam_cont)
+
+        self._center_split = QSplitter(Qt.Orientation.Vertical)
+        self._center_split.setStyleSheet(f"""
+            QSplitter::handle {{
+                background: {C.BORDER};
+                height: 4px;
+            }}
+            QSplitter::handle:hover {{
+                background: {C.PRI_DIM};
+            }}
+        """)
+        self._center_split.addWidget(self._hud_cam_stack)
+        self._center_split.addWidget(self._content_panel)
+        self._center_split.setStretchFactor(0, 3)
+        self._center_split.setStretchFactor(1, 1)
+        self._center_split.setCollapsible(0, False)
+        body.addWidget(self._center_split, stretch=5)
 
         self._right_panel = self._build_right_panel()
         body.addWidget(self._right_panel, stretch=0)
@@ -1284,6 +1408,14 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
+        self._reconfig_sig.connect(self._show_setup)
+        self._camera_sig.connect(self._show_camera_frame)
+        self._cam_stream_sig.connect(self._on_cam_stream)
+        self._cam_frame_sig.connect(self._on_cam_frame)
+        self._cam_stop = threading.Event()
+
+        # Camera preview overlay (child of central widget, positioned in resizeEvent)
+        self._cam_preview = _CameraPreview(self.centralWidget())
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -1294,6 +1426,347 @@ class MainWindow(QMainWindow):
         sc_mute.activated.connect(self._toggle_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
+        sc_intr = QShortcut(QKeySequence("Escape"), self)
+        sc_intr.activated.connect(self._do_interrupt)
+
+    def _show_camera_frame(self, img_bytes: bytes):
+        """Slot — display camera preview overlay (main thread)."""
+        self._cam_preview.show_frame(img_bytes)
+        cw = self.centralWidget()
+        pw = _CameraPreview._W
+        ph = self._cam_preview.height()
+        self._cam_preview.setGeometry(
+            cw.width() - _RIGHT_W - pw - 12,
+            cw.height() - ph - 28,
+            pw, ph,
+        )
+
+    # --- Live camera stream in HUD area ------------------------------------
+    def _on_cam_stream(self, start: bool) -> None:
+        if start:
+            self._hud_cam_stack.setCurrentIndex(1)
+        else:
+            self._hud_cam_stack.setCurrentIndex(0)
+            self._cam_live_lbl.clear()
+
+    def _on_cam_frame(self, data: bytes) -> None:
+        px = QPixmap()
+        px.loadFromData(data)
+        if not px.isNull():
+            w, h = self._cam_live_lbl.width(), self._cam_live_lbl.height()
+            if w > 1 and h > 1:
+                self._cam_live_lbl.setPixmap(
+                    px.scaled(w, h,
+                              Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+                )
+
+    def start_camera_stream(self) -> None:
+        self._cam_stop.clear()
+        self._cam_stream_sig.emit(True)
+        t = threading.Thread(target=self._cam_loop, daemon=True, name="cam-stream")
+        t.start()
+
+    def _cam_loop(self) -> None:
+        try:
+            import cv2
+            # Reuse camera index detected by screen_processor (cached in api_keys.json)
+            cam_idx = 0
+            try:
+                import json as _j
+                cfg = _j.loads((CONFIG_DIR / "api_keys.json").read_text())
+                cam_idx = int(cfg.get("camera_index", 0))
+            except Exception:
+                pass
+            try:
+                backend = cv2.CAP_DSHOW if _OS == "Windows" else cv2.CAP_ANY
+            except AttributeError:
+                backend = 0
+            cap = cv2.VideoCapture(cam_idx, backend)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                return
+            # warm-up frames
+            for _ in range(5):
+                cap.read()
+            while not self._cam_stop.wait(0.033) and cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                    self._cam_frame_sig.emit(buf.tobytes())
+            cap.release()
+        except Exception as e:
+            print(f"[Camera] Stream error: {e}")
+        finally:
+            self._cam_stream_sig.emit(False)
+
+    def stop_camera_stream(self) -> None:
+        self._cam_stop.set()
+
+    # ------------------------------------------------------------------
+    # Icon generation — arc-reactor style, rendered with Pillow
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_jarvis_icon(out_path: Path) -> bool:
+        """
+        Render a JARVIS arc-reactor icon at 4× resolution and downsample
+        for crisp results at all sizes. Saves a multi-res .ico to out_path.
+        Returns True on success.
+        """
+        try:
+            import math
+            import PIL.Image
+            import PIL.ImageDraw
+            import PIL.ImageFilter
+        except ImportError:
+            return False
+
+        CYAN   = (0, 212, 255)
+        DIM    = (0, 100, 140)
+        DARK   = (0, 6, 10)
+        GLOW   = (0, 160, 200)
+        WHITE  = (220, 240, 255)
+
+        def _render(sz: int) -> PIL.Image.Image:
+            S  = sz * 4                     # draw at 4× then downscale
+            img = PIL.Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            d   = PIL.ImageDraw.Draw(img)
+            cx = cy = S // 2
+
+            # ── filled background circle ──────────────────────────────────
+            R = S // 2 - 2
+            d.ellipse([cx-R, cy-R, cx+R, cy+R], fill=(*DARK, 255))
+
+            # ── outer border ring ─────────────────────────────────────────
+            lw = max(2, S // 40)
+            d.ellipse([cx-R, cy-R, cx+R, cy+R],
+                      outline=(*CYAN, 220), width=lw)
+
+            # ── mid decorative ring ───────────────────────────────────────
+            R2 = int(R * 0.72)
+            d.ellipse([cx-R2, cy-R2, cx+R2, cy+R2],
+                      outline=(*DIM, 180), width=max(1, lw // 2))
+
+            # ── 6 radial spokes (hex bolt) ────────────────────────────────
+            R_inner = int(R * 0.30)
+            R_outer = int(R * 0.62)
+            spoke_w = max(1, S // 80)
+            for i in range(6):
+                angle = math.radians(i * 60 - 30)
+                x1 = cx + int(R_inner * math.cos(angle))
+                y1 = cy + int(R_inner * math.sin(angle))
+                x2 = cx + int(R_outer * math.cos(angle))
+                y2 = cy + int(R_outer * math.sin(angle))
+                d.line([x1, y1, x2, y2], fill=(*GLOW, 200), width=spoke_w)
+
+            # ── 6 tick marks on outer ring ────────────────────────────────
+            for i in range(6):
+                angle = math.radians(i * 60)
+                for dr in range(lw * 2):
+                    rx = (R - lw - dr)
+                    d.point(
+                        [cx + int(rx * math.cos(angle)),
+                         cy + int(rx * math.sin(angle))],
+                        fill=(*WHITE, 220),
+                    )
+
+            # ── inner glowing ring ────────────────────────────────────────
+            Ri = int(R * 0.26)
+            d.ellipse([cx-Ri, cy-Ri, cx+Ri, cy+Ri],
+                      outline=(*CYAN, 255), width=max(2, lw))
+
+            # ── bright glow soft blur applied before core ─────────────────
+            # (draw a slightly larger cyan circle on a separate layer)
+            glow_layer = PIL.Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            gd = PIL.ImageDraw.Draw(glow_layer)
+            Rc = int(R * 0.13)
+            gd.ellipse([cx-Rc*2, cy-Rc*2, cx+Rc*2, cy+Rc*2],
+                       fill=(*CYAN, 110))
+            glow_layer = glow_layer.filter(PIL.ImageFilter.GaussianBlur(S // 14))
+            img = PIL.Image.alpha_composite(img, glow_layer)
+            d   = PIL.ImageDraw.Draw(img)
+
+            # ── core dot ──────────────────────────────────────────────────
+            d.ellipse([cx-Rc, cy-Rc, cx+Rc, cy+Rc], fill=(*WHITE, 255))
+
+            # ── downscale to target size ──────────────────────────────────
+            return img.resize((sz, sz), PIL.Image.LANCZOS)
+
+        try:
+            sizes  = [256, 128, 64, 48, 32, 16]
+            frames = [_render(s) for s in sizes]
+            frames[0].save(
+                out_path,
+                format="ICO",
+                append_images=frames[1:],
+                sizes=[(s, s) for s in sizes],
+            )
+            return True
+        except Exception as e:
+            print(f"[Shortcut] ⚠️  Icon generation failed: {e}")
+            return False
+
+    @staticmethod
+    def _create_lnk_windows(lnk: str, target: str, args: str,
+                             work_dir: str, icon_loc: str) -> None:
+        """
+        Create a Windows .lnk shortcut WITHOUT launching PowerShell or cmd.
+        Tries win32com (pywin32) first; falls back to wscript.exe + VBScript.
+        wscript.exe is a GUI-mode host — it never opens a console window.
+        """
+        # ── Option 1: pywin32 (pure Python COM, zero subprocess) ──────────
+        try:
+            from win32com.client import Dispatch   # type: ignore
+            sh = Dispatch("WScript.Shell")
+            sc = sh.CreateShortCut(lnk)
+            sc.TargetPath       = target
+            sc.Arguments        = f'"{args}"'
+            sc.WorkingDirectory = work_dir
+            sc.Description      = "J.A.R.V.I.S AI Assistant"
+            sc.IconLocation     = icon_loc
+            sc.save()
+            return
+        except ImportError:
+            pass
+
+        # ── Option 2: wscript.exe + VBScript (always available on Windows,
+        #    GUI-mode executable — never opens a console window) ────────────
+        vbs = "\n".join([
+            'Set ws = CreateObject("WScript.Shell")',
+            f'Set sc = ws.CreateShortcut("{lnk}")',
+            f'sc.TargetPath = "{target}"',
+            f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
+            f'sc.WorkingDirectory = "{work_dir}"',
+            'sc.Description = "J.A.R.V.I.S AI Assistant"',
+            f'sc.IconLocation = "{icon_loc}"',
+            'sc.Save',
+        ])
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".vbs")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(vbs)
+            proc = subprocess.Popen(
+                ["wscript.exe", "/nologo", tmp],
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+            )
+            proc.wait(timeout=10)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    def _create_desktop_shortcut(self):
+        """
+        Create a desktop shortcut on Windows / macOS / Linux.
+        Never opens a terminal, console, or PowerShell window on any platform.
+        """
+        import stat as _stat
+        script  = Path(__file__).resolve().parent / "main.py"
+        python  = Path(sys.executable)
+        desktop = Path.home() / "Desktop"
+
+        # Arc-reactor icon (.ico — also exported as .png for Linux/macOS)
+        ico_path = Path(__file__).resolve().parent / "config" / "jarvis.ico"
+        if not ico_path.exists():
+            self._build_jarvis_icon(ico_path)
+
+        try:
+            _os = platform.system()
+
+            # ── Windows ───────────────────────────────────────────────────────
+            if _os == "Windows":
+                pythonw  = python.parent / "pythonw.exe"
+                target   = str(pythonw if pythonw.exists() else python)
+                lnk      = str(desktop / "J.A.R.V.I.S.lnk")
+                icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
+                self._create_lnk_windows(lnk, target, str(script),
+                                         str(script.parent), icon_loc)
+
+            # ── macOS — proper .app bundle (no Terminal window) ───────────────
+            elif _os == "Darwin":
+                app     = desktop / "J.A.R.V.I.S.app"
+                mac_dir = app / "Contents" / "MacOS"
+                res_dir = app / "Contents" / "Resources"
+                mac_dir.mkdir(parents=True, exist_ok=True)
+                res_dir.mkdir(exist_ok=True)
+
+                # Launcher executable (bash — runs as background process,
+                # macOS does NOT open Terminal for executables inside .app bundles)
+                launcher = mac_dir / "JARVIS"
+                launcher.write_text(
+                    "#!/usr/bin/env bash\n"
+                    f'cd "{script.parent}"\n'
+                    f'exec "{python}" "{script}"\n'
+                )
+                launcher.chmod(launcher.stat().st_mode
+                               | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
+
+                # Minimal Info.plist (required for .app recognition)
+                (app / "Contents" / "Info.plist").write_text(
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                    '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                    '<plist version="1.0"><dict>\n'
+                    '  <key>CFBundleExecutable</key><string>JARVIS</string>\n'
+                    '  <key>CFBundleIdentifier</key>'
+                    '<string>com.jarvis.assistant</string>\n'
+                    '  <key>CFBundleName</key><string>J.A.R.V.I.S</string>\n'
+                    '  <key>CFBundlePackageType</key><string>APPL</string>\n'
+                    '  <key>CFBundleVersion</key><string>1.0</string>\n'
+                    '</dict></plist>\n'
+                )
+
+                # Optional: copy icon as .icns (skip silently if Pillow is missing)
+                try:
+                    import PIL.Image
+                    icns = res_dir / "AppIcon.icns"
+                    PIL.Image.open(ico_path).save(icns, format="ICNS")
+                    # Inject icon reference into plist
+                    plist = app / "Contents" / "Info.plist"
+                    txt = plist.read_text()
+                    plist.write_text(
+                        txt.replace(
+                            '</dict></plist>',
+                            '  <key>CFBundleIconFile</key>'
+                            '<string>AppIcon</string>\n</dict></plist>\n',
+                        )
+                    )
+                except Exception:
+                    pass  # icon is optional
+
+            # ── Linux — .desktop file (Terminal=false, no console) ────────────
+            else:
+                # Export .ico → .png for better desktop integration
+                png_path = ico_path.with_suffix(".png")
+                if not png_path.exists() and ico_path.exists():
+                    try:
+                        import PIL.Image
+                        PIL.Image.open(ico_path).resize(
+                            (256, 256), PIL.Image.LANCZOS
+                        ).save(png_path, format="PNG")
+                    except Exception:
+                        png_path = ico_path  # fallback to .ico
+
+                icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
+                desk = desktop / "J.A.R.V.I.S.desktop"
+                desk.write_text(
+                    "[Desktop Entry]\n"
+                    "Name=J.A.R.V.I.S\n"
+                    f"Exec={python} {script}\n"
+                    f"Path={script.parent}\n"
+                    "Type=Application\n"
+                    "Terminal=false\n"
+                    "Categories=Utility;\n"
+                    + icon_line
+                )
+                desk.chmod(desk.stat().st_mode | 0o755)
+
+            self._log.append_log("SYS: Desktop shortcut created.")
+        except Exception as e:
+            self._log.append_log(f"ERR: Shortcut failed — {e}")
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1318,6 +1791,14 @@ class MainWindow(QMainWindow):
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
+        # Camera preview — bottom-right corner of the center/HUD area
+        pw = _CameraPreview._W
+        ph = self._cam_preview.height() or _CameraPreview._H
+        self._cam_preview.setGeometry(
+            cw.width() - _RIGHT_W - pw - 12,
+            cw.height() - ph - 28,
+            pw, ph,
+        )
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -1383,7 +1864,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_badge("MARK XLVII", C.PRI_DIM))
+        lay.addWidget(_badge("MARK XLVIII", C.PRI_DIM))
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
@@ -1470,12 +1951,14 @@ class MainWindow(QMainWindow):
         ip_lay.addWidget(os_lbl)
 
         lay.addWidget(info_panel)
+        lay.addSpacing(4)
+
         lay.addStretch()
 
         for txt, col in [
             ("AI CORE\nACTIVE",     C.GREEN),
             ("SEC\nCLEARED",        C.PRI),
-            ("PROTOCOL\nXXXVIII",   C.TEXT_DIM),
+            ("PROTOCOL\nXLVIII",    C.TEXT_DIM),
         ]:
             lbl = QLabel(txt)
             lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
@@ -1527,6 +2010,25 @@ class MainWindow(QMainWindow):
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
 
+        self._interrupt_btn = QPushButton("✋  INTERRUPT  [ESC]")
+        self._interrupt_btn.setFixedHeight(34)
+        self._interrupt_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._interrupt_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #140008; color: {C.MUTED_C};
+                border: 1px solid {C.MUTED_C}; border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                background: #200010; border: 1px solid #ff6688;
+            }}
+            QPushButton:pressed {{
+                background: #300018;
+            }}
+        """)
+        self._interrupt_btn.clicked.connect(self._do_interrupt)
+        lay.addWidget(self._interrupt_btn)
+
         self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
         self._mute_btn.setFixedHeight(30)
         self._mute_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
@@ -1566,6 +2068,22 @@ class MainWindow(QMainWindow):
         """)
         fs_btn.clicked.connect(self._toggle_fullscreen)
         lay.addWidget(fs_btn)
+
+        sc_btn = QPushButton("⊞  CREATE DESKTOP SHORTCUT")
+        sc_btn.setFixedHeight(26)
+        sc_btn.setFont(QFont("Courier New", 7))
+        sc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        sc_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{
+                color: {C.ACC2}; border: 1px solid {C.BORDER_B};
+            }}
+        """)
+        sc_btn.clicked.connect(self._create_desktop_shortcut)
+        lay.addWidget(sc_btn)
 
         return w
 
@@ -1663,7 +2181,10 @@ class MainWindow(QMainWindow):
         self._content_display = QTextEdit()
         self._content_display.setReadOnly(True)
         self._content_display.setFont(QFont("Courier New", 8))
-        self._content_display.setFixedHeight(155)
+        self._content_display.setMinimumHeight(60)
+        self._content_display.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self._content_display.setStyleSheet(f"""
             QTextEdit {{
                 background: {C.DARK};
@@ -1693,13 +2214,14 @@ class MainWindow(QMainWindow):
         self._content_title_lbl.setText(title.upper()[:48])
         self._content_ts_lbl.setText(_time.strftime("%H:%M:%S"))
         self._content_display.setPlainText(text)
-        # Scroll to top
-        cur = self._content_display.textCursor()
-        cur.moveToStart() if hasattr(cur, "moveToStart") else None
         self._content_display.moveCursor(
             self._content_display.textCursor().MoveOperation.Start
         )
+        first_show = not self._content_panel.isVisible()
         self._content_panel.show()
+        if first_show:
+            total = self._center_split.height()
+            self._center_split.setSizes([max(total - 220, 120), 220])
 
     def _build_footer(self) -> QWidget:
         w = QWidget()
@@ -1714,7 +2236,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
-        lay.addWidget(_fl("FatihMakes Industries  ·  MARK XLVII  ·  CLASSIFIED"))
+        lay.addWidget(_fl("FatihMakes Industries  ·  MARK XLVIII  ·  CLASSIFIED"))
         lay.addStretch()
         lay.addWidget(_fl("© STARK INDUSTRIES", C.PRI_DIM))
         return w
@@ -1768,6 +2290,10 @@ class MainWindow(QMainWindow):
         ov.show()
         self._remote_overlay = ov
         self._log.append_log(f"SYS: Remote key generated — manual: {manual or url}")
+
+    def _do_interrupt(self):
+        if self.on_interrupt:
+            self.on_interrupt()
 
     def _toggle_mute(self):
         self._muted = not self._muted
@@ -1891,6 +2417,14 @@ class JarvisUI:
     def on_remote_clicked(self, cb):
         self._win.on_remote_clicked = cb
 
+    @property
+    def on_interrupt(self):
+        return self._win.on_interrupt
+
+    @on_interrupt.setter
+    def on_interrupt(self, cb):
+        self._win.on_interrupt = cb
+
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
 
@@ -1907,6 +2441,23 @@ class JarvisUI:
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
         self._win._content_sig.emit(title[:48], text[:4000])
+
+    def prompt_reconfig(self):
+        """Thread-safe: show the API key setup overlay (e.g. after an auth error)."""
+        self._win._ready = False
+        self._win._reconfig_sig.emit()
+
+    def show_camera_frame(self, img_bytes: bytes):
+        """Thread-safe: show a webcam frame in the small overlay (screen captures)."""
+        self._win._camera_sig.emit(img_bytes)
+
+    def start_camera_stream(self) -> None:
+        """Thread-safe: start live camera feed in the full HUD area."""
+        self._win.start_camera_stream()
+
+    def stop_camera_stream(self) -> None:
+        """Thread-safe: stop the live camera feed."""
+        self._win.stop_camera_stream()
 
     def start_speaking(self):
         self.set_state("SPEAKING")

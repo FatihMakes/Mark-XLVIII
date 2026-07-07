@@ -1,9 +1,9 @@
 """
 System Monitor — background metric checks with voice alert support.
-Works on Windows, macOS, and Linux without external APIs.
+Zero subprocess calls on all platforms — uses ctypes/pynvml/psutil/wmi only.
 """
+import ctypes
 import platform
-import subprocess
 import time
 
 import psutil
@@ -11,52 +11,79 @@ import psutil
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 DEFAULT_THRESHOLDS = {
-    "cpu":  90.0,   # %  — fires after _CPU_STREAK consecutive readings
-    "ram":  90.0,   # %
-    "temp": 85.0,   # °C
-    "gpu":  95.0,   # %
+    "cpu":  90.0,
+    "ram":  90.0,
+    "temp": 85.0,
+    "gpu":  95.0,
 }
 
-_COOLDOWN   = 300   # seconds between same-type alerts (5 min)
-_CPU_STREAK = 3     # consecutive high readings required before CPU alert
+_COOLDOWN   = 300
+_CPU_STREAK = 3
+
+# ── NVML DLL cache (Windows: nvml.dll, Linux: libnvidia-ml.so.1) ─────────────
+_nvml_lib: object = None
+_nvml_ok:  object = None   # None=untested  True=works  False=unavailable
+
+
+def _nvml_gpu() -> float:
+    """GPU utilisation via NVML — zero subprocess on all platforms."""
+    global _nvml_lib, _nvml_ok
+    if _nvml_ok is False:
+        return -1.0
+    try:
+        class _Util(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        if _nvml_lib is None:
+            if _OS == "Windows":
+                candidates = ("nvml", r"C:\Windows\System32\nvml.dll")
+                _load = ctypes.WinDLL
+            else:
+                candidates = (
+                    "libnvidia-ml.so.1",
+                    "libnvidia-ml.so",
+                    "libnvidia-ml.dylib",
+                )
+                _load = ctypes.CDLL
+            for name in candidates:
+                try:
+                    lib = _load(name)
+                    lib.nvmlInit_v2()
+                    _nvml_lib = lib
+                    break
+                except Exception:
+                    continue
+
+        if _nvml_lib is None:
+            _nvml_ok = False
+            return -1.0
+
+        dev = ctypes.c_void_p()
+        _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
+        u = _Util()
+        _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u))
+        _nvml_ok = True
+        return float(u.gpu)
+    except Exception:
+        _nvml_ok = False
+        return -1.0
 
 
 def _get_gpu_usage() -> float:
-    # NVIDIA
+    # pynvml — subprocess-free, works everywhere if installed
     try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if r.returncode == 0:
-            vals = [float(v.strip()) for v in r.stdout.strip().split("\n") if v.strip()]
-            return sum(vals) / len(vals) if vals else -1.0
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
     except Exception:
         pass
 
-    # AMD (Linux)
-    if _OS == "Linux":
-        try:
-            r = subprocess.run(
-                ["rocm-smi", "--showuse", "--csv"],
-                capture_output=True, text=True, timeout=2,
-            )
-            if r.returncode == 0:
-                for line in r.stdout.strip().split("\n"):
-                    parts = line.split(",")
-                    if len(parts) >= 2:
-                        try:
-                            return float(parts[1].strip().replace("%", ""))
-                        except ValueError:
-                            pass
-        except Exception:
-            pass
-
-    return -1.0
+    return _nvml_gpu()
 
 
 def _get_cpu_temp() -> float:
-    # psutil sensors (Linux + some Windows drivers)
+    # psutil — works on Linux; occasionally Windows with proper drivers
     try:
         temps = psutil.sensors_temperatures()
         for name in ["coretemp", "k10temp", "cpu_thermal", "acpitz",
@@ -69,32 +96,14 @@ def _get_cpu_temp() -> float:
     except Exception:
         pass
 
-    # Windows — WMI thermal zone
+    # Windows: wmi module (pure Python COM, zero subprocess)
     if _OS == "Windows":
         try:
-            r = subprocess.run(
-                ["powershell", "-Command",
-                 "(Get-WmiObject MSAcpi_ThermalZoneTemperature "
-                 "-Namespace root/wmi).CurrentTemperature"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                raw = float(r.stdout.strip().split("\n")[0])
-                return (raw / 10.0) - 273.15
-        except Exception:
-            pass
-
-    # macOS — osx-cpu-temp (optional CLI tool)
-    if _OS == "Darwin":
-        try:
-            r = subprocess.run(
-                ["osx-cpu-temp"], capture_output=True, text=True, timeout=2,
-            )
-            if r.returncode == 0:
-                import re
-                m = re.search(r"([\d.]+)", r.stdout)
-                if m:
-                    return float(m.group(1))
+            import wmi  # type: ignore
+            w = wmi.WMI(namespace="root/wmi")
+            tz = w.MSAcpi_ThermalZoneTemperature()
+            if tz:
+                return (tz[0].CurrentTemperature / 10.0) - 273.15
         except Exception:
             pass
 
@@ -102,10 +111,7 @@ def _get_cpu_temp() -> float:
 
 
 def get_system_status() -> dict:
-    """
-    Snapshot of current system metrics.
-    Used by the system_status tool so the user can ask verbally.
-    """
+    """Snapshot of current system metrics for the system_status tool."""
     cpu  = psutil.cpu_percent(interval=0.2)
     ram  = psutil.virtual_memory()
     temp = _get_cpu_temp()
@@ -131,8 +137,7 @@ def get_system_status() -> dict:
 class SystemMonitor:
     """
     Stateful monitor — cooldown state persists across session reconnections.
-    Call check() periodically; it returns a [SYSTEM_ALERT] string when a
-    threshold is exceeded, or None when everything is fine.
+    Call check() periodically; returns a [SYSTEM_ALERT] string or None.
     """
 
     def __init__(self, thresholds: dict | None = None):
@@ -147,10 +152,6 @@ class SystemMonitor:
         self._last_alert[key] = time.monotonic()
 
     def check(self) -> str | None:
-        """
-        Reads current metrics synchronously.
-        Returns an instruction string for Jarvis to speak, or None.
-        """
         try:
             cpu  = psutil.cpu_percent(interval=None)
             ram  = psutil.virtual_memory().percent
@@ -161,7 +162,6 @@ class SystemMonitor:
 
         alerts: list[str] = []
 
-        # CPU — require consecutive readings to avoid transient spikes
         if cpu >= self.thresholds["cpu"]:
             self._cpu_streak += 1
             if self._cpu_streak >= _CPU_STREAK and self._can_alert("cpu"):
