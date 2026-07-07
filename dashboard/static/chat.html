@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JARVIS Chat Assistant</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    :root {
+      --bg-primary: #0a0e1a;
+      --bg-secondary: #0f1419;
+      --bg-tertiary: #151b28;
+      --accent: #00d9ff;
+      --accent-dark: #0099cc;
+      --text-primary: #e0e8ff;
+      --text-secondary: #a0aac0;
+      --text-muted: #707080;
+      --border: rgba(0, 217, 255, 0.1);
+      --border-light: rgba(255, 255, 255, 0.05);
+      --user-bg: rgba(0, 153, 204, 0.12);
+      --assistant-bg: rgba(0, 217, 255, 0.08);
+      --success: #10b981;
+      --error: #ef4444;
+    }
+    
+    html, body {
+      height: 100%;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      overflow: hidden;
+    }
+    
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+    
+    /* ─────────────────────────────────────────────────────────────────────── */
+    /* HEADER */
+    /* ─────────────────────────────────────────────────────────────────────── */
+    
+    header {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    }
+    
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    
+    .logo {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 3px;
+      color: var(--accent);
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .logo::before {
+      content: '◆';
+      font-size: 12px;
+      animation: pulse 2s infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      background: rgba(0, 217, 255, 0.08);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--success);
+      animation: blink 1.5s infinite;
+    }
+    
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+    
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    
+    .btn-icon {
+      width: 36px;
+      height: 36px;
+      border: none;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-secondary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      transition: all 0.2s;
+    }
+    
+    .btn-icon:hover {
+      background: rgba(0, 217, 255, 0.15);
+      color: var(--accent);
+    }
+    
+    /* ─────────────────────────────────────────────────────────────────────── */
+    /* CHAT CONTAINER */
+    /* ─────────────────────────────────────────────────────────────────────── */
+    
+    .chat-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    
+    .messages::-webkit-scrollbar {
+      width: 6px;
+    }
+    
+    .messages::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    
+    .messages::-webkit-scrollbar-thumb {
+      background: rgba(0, 217, 255, 0.2);
+      border-radius: 3px;
+    }
+    
+    .messages::-webkit-scrollbar-thumb:hover {
+      background: rgba(0, 217, 255, 0.4);
+    }
+    
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      gap: 12px;
+    }
+    
+    .empty-icon {
+      font-size: 48px;
+      opacity: 0.3;
+    }
+    
+    .empty-text {
+      font-size: 14px;
+      color: var(--text-secondary);
+      text-align: center;
+    }
+    
+    .empty-subtext {
+      font-size: 12px;
+      color: var(--text-muted);
+      max-width: 300px;
+    }
+    
+    /* ─────────────────────────────────────────────────────────────────────── */
+    /* MESSAGE STYLES */
+    /* ─────────────────────────────────────────────────────────────────────── */
+    
+    .message {
+      display: flex;
+      gap: 10px;
+      animation: slideIn 0.3s ease;
+      align-items: flex-start;
+    }
+    
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    
+    .message.user {
+      justify-content: flex-end;
+    }
+    
+    .message.assistant {
+      justify-content: flex-start;
+    }
+    
+    .message-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      flex-shrink: 0;
+      font-weight: 600;
+    }
+    
+    .message.assistant .message-avatar {
+      background: rgba(0, 217, 255, 0.15);
+      color: var(--accent);
+    }
+    
+    .message.user .message-avatar {
+      background: rgba(0, 153, 204, 0.15);
+      color: #0099cc;
+      display: none;
+    }
+    
+    .message-content {
+      max-width: 70%;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    
+    .message.user .message-content {
+      align-items: flex-end;
+    }
+    
+    .message-bubble {
+      padding: 12px 16px;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.5;
+      word-wrap: break-word;
+    }
+    
+    .message.assistant .message-bubble {
+      background: var(--assistant-bg);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      border-bottom-left-radius: 4px;
+    }
+    
+    .message.user .message-bubble {
+      background: var(--user-bg);
+      border: 1px solid rgba(0, 153, 204, 0.2);
+      color: var(--text-primary);
+      border-bottom-right-radius: 4px;
+    }
+    
+    .message.system .message-bubble {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 12px;
+      text-align: center;
+      padding: 8px 0;
+    }
+    
+    .message-time {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 0 4px;
+      white-space: nowrap;
+    }
+    
+    .message.assistant .message-time {
+      text-align: left;
+    }
+    
+    .message.user .message-time {
+      text-align: right;
+    }
+    
+    .typing-indicator {
+      display: flex;
+      gap: 4px;
+      padding: 12px 16px;
+      background: var(--assistant-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      border-bottom-left-radius: 4px;
+      width: fit-content;
+    }
+    
+    .typing-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: typing 1.4s infinite;
+    }
+    
+    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+    
+    @keyframes typing {
+      0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+      30% { opacity: 1; transform: translateY(-8px); }
+    }
+    
+    /* ─────────────────────────────────────────────────────────────────────── */
+    /* INPUT AREA */
+    /* ─────────────────────────────────────────────────────────────────────── */
+    
+    .input-area {
+      flex-shrink: 0;
+      padding: 16px 20px;
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border-light);
+    }
+    
+    .input-wrapper {
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+    
+    .input-field {
+      flex: 1;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border-light);
+      border-radius: 10px;
+      padding: 12px 16px;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-family: inherit;
+      resize: none;
+      max-height: 120px;
+      transition: all 0.2s;
+    }
+    
+    .input-field:focus {
+      outline: none;
+      border-color: var(--border);
+      background: var(--bg-primary);
+      box-shadow: 0 0 0 2px rgba(0, 217, 255, 0.1);
+    }
+    
+    .input-field::placeholder {
+      color: var(--text-muted);
+    }
+    
+    .btn-send {
+      width: 40px;
+      height: 40px;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%);
+      color: white;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+    
+    .btn-send:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 217, 255, 0.3);
+    }
+    
+    .btn-send:active:not(:disabled) {
+      transform: translateY(0);
+    }
+    
+    .btn-send:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    
+    /* ─────────────────────────────────────────────────────────────────────── */
+    /* RESPONSIVE */
+    /* ─────────────────────────────────────────────────────────────────────── */
+    
+    @media (max-width: 768px) {
+      .message-content {
+        max-width: 85%;
+      }
+      
+      header {
+        padding: 10px 16px;
+      }
+      
+      .input-area {
+        padding: 12px 16px;
+      }
+      
+      .messages {
+        padding: 16px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- HEADER -->
+  <header>
+    <div class="header-left">
+      <div class="logo">JARVIS</div>
+      <div class="status">
+        <div class="status-dot"></div>
+        ONLINE
+      </div>
+    </div>
+    <div class="header-right">
+      <button class="btn-icon" title="Settings" id="btnSettings">⚙️</button>
+      <button class="btn-icon" title="Clear Chat" id="btnClear">🗑️</button>
+    </div>
+  </header>
+
+  <!-- CHAT CONTAINER -->
+  <div class="chat-container">
+    <!-- MESSAGES -->
+    <div class="messages" id="messagesContainer">
+      <div class="empty-state">
+        <div class="empty-icon">🤖</div>
+        <div class="empty-text">Welcome to JARVIS</div>
+        <div class="empty-subtext">Your AI Assistant is ready. Start a conversation!</div>
+      </div>
+    </div>
+
+    <!-- INPUT AREA -->
+    <div class="input-area">
+      <div class="input-wrapper">
+        <textarea
+          id="messageInput"
+          class="input-field"
+          placeholder="Type your message... (Shift+Enter for new line)"
+          rows="1"
+        ></textarea>
+        <button class="btn-send" id="btnSend" title="Send message">➤</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ──────────────────────────────────────────────────────────────────────────────
+    // CONFIGURATION
+    // ──────────────────────────────────────────────────────────────────────────────
+    
+    // Use protocol-relative URLs to support both HTTP and HTTPS
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const apiProtocol = window.location.protocol;
+    const WS_URL = `${protocol}//${window.location.host}/api/chat/ws`;
+    const API_URL = `${apiProtocol}//${window.location.host}/api/chat`;
+    
+    let ws = null;
+    let isConnected = false;
+    let isWaitingForResponse = false;
+    
+    // ──────────────────────────────────────────────────────────────────────────────
+    // DOM ELEMENTS
+    // ──────────────────────────────────────────────────────────────────────────────
+    
+    const messagesContainer = document.getElementById('messagesContainer');
+    const messageInput = document.getElementById('messageInput');
+    const btnSend = document.getElementById('btnSend');
+    const btnClear = document.getElementById('btnClear');
+    const btnSettings = document.getElementById('btnSettings');
+    
+    // ──────────────────────────────────────────────────────────────────────────────
+    // MESSAGE RENDERING
+    // ──────────────────────────────────────────────────────────────────────────────
+    
+    function formatTime(date = new Date()) {
+      return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    }
+    
+    function createMessageElement(role, content, timestamp = null) {
+      const container = document.createElement('div');
+      container.className = `message ${role}`;
+      
+      const avatar = document.createElement('div');
+      avatar.className = 'message-avatar';
+      avatar.textContent = role === 'assistant' ? '🤖' : '👤';
+      
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'message-content';
+      
+      const bubble = document.createElement('div');
+      bubble.className = 'message-bubble';
+      bubble.innerHTML = escapeHtml(content).replace(/\n/g, '<br>');
+      
+      const time = document.createElement('div');
+      time.className = 'message-time';
+      time.textContent = timestamp || formatTime();
+      
+      contentDiv.appendChild(bubble);
+      contentDiv.appendChild(time);
+      
+      if (role !== 'user') {
+        container.appendChild(avatar);
+      }
+      container.appendChild(contentDiv);
+      
+      return container;
+    }
+    
+    function clearEmptyState() {
+      if (messagesContainer.querySelector('.empty-state')) {
+        messagesContainer.innerHTML = '';
+      }
+    }
+    
+    function addMessage(role, content, timestamp = null) {
+      clearEmptyState();
+      const messageEl = createMessageElement(role, content, timestamp);
+      messagesContainer.appendChild(messageEl);
+      scrollToBottom();
+    }
+    
+    function addTypingIndicator() {
+      clearEmptyState();
+      const container = document.createElement('div');
+      container.className = 'message assistant';
+      container.id = 'typingIndicator';
+      
+      const avatar = document.createElement('div');
+      avatar.className = 'message-avatar';
+      avatar.textContent = '🤖';
+      
+      const indicator = document.createElement('div');
+      indicator.className = 'typing-indicator';
+      indicator.innerHTML = '<div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>';
+      
+      container.appendChild(avatar);
+      container.appendChild(indicator);
+      messagesContainer.appendChild(container);
+      scrollToBottom();
+    }
+    
+    function removeTypingIndicator() {
+      const indicator = document.getElementById('typingIndicator');
+      if (indicator) {
+        indicator.remove();
+      }
+    }
+    
+    function scrollToBottom() {
+      setTimeout(() => {
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      }, 0);
+    }
+    
+    function escapeHtml(text) {
+      const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+      };
+      return text.replace(/[&<>"']/g, m => map[m]);
+    }
+    
+    // ──────────────────────────────────────────────────────────────────────────────
+    // WEBSOCKET MANAGEMENT
+    // ──────────────────────────────────────────────────────────────────────────────
+    
+    function connectWebSocket() {
+      ws = new WebSocket(WS_URL);
+      
+      ws.onopen = () => {
+        console.log('✓ Connected to JARVIS');
+        isConnected = true;
+        btnSend.disabled = false;
+      };
+      
+      ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          handleMessage(message);
+        } catch (e) {
+          console.error('Failed to parse WebSocket message:', e);
+          // Log raw message for debugging
+          console.debug('Raw message:', event.data);
+        }
+      };
+      
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        isConnected = false;
+        addMessage('system', '⚠️ Connection error. Retrying...');
+      };
+      
+      ws.onclose = () => {
+        console.log('✗ Disconnected from JARVIS');
+        isConnected = false;
+        btnSend.disabled = true;
+        setTimeout(connectWebSocket, 3000); // Reconnect after 3 seconds
+      };
+    }
+    
+    function handleMessage(message) {
+      const { type, content, data } = message;
+      
+      switch (type) {
+        case 'user_message':
+          addMessage('user', data.content, data.timestamp);
+          addTypingIndicator();
+          isWaitingForResponse = true;
+          break;
+          
+        case 'assistant_chunk':
+          if (!isWaitingForResponse) {
+            addTypingIndicator();
+            isWaitingForResponse = true;
+          }
+          removeTypingIndicator();
+          // Append to last message or create new one if no bubble exists
+          let lastBubble = messagesContainer.querySelector('.message.assistant:last-child .message-bubble');
+          if (!lastBubble) {
+            // Create a new assistant message if none exists (handles reconnect case)
+            addMessage('assistant', content);
+            lastBubble = messagesContainer.querySelector('.message.assistant:last-child .message-bubble');
+          } else {
+            lastBubble.innerHTML += escapeHtml(content).replace(/\n/g, '<br>');
+          }
+          addTypingIndicator();
+          scrollToBottom();
+          break;
+          
+        case 'assistant_message':
+          removeTypingIndicator();
+          addMessage('assistant', content);
+          isWaitingForResponse = false;
+          break;
+          
+        case 'message_complete':
+          removeTypingIndicator();
+          addMessage('assistant', data.content, data.timestamp);
+          isWaitingForResponse = false;
+          break;
+          
+        case 'error':
+          removeTypingIndicator();
+          addMessage('system', `❌ ${message.message}`);
+          isWaitingForResponse = false;
+          break;
+          
+        case 'pong':
+          // Keep-alive response
+          break;
+      }
+    }
+    
+    function sendMessage(text) {
+      if (!text.trim() || !isConnected || isWaitingForResponse) return;
+      
+      messageInput.value = '';
+      autoResizeInput();
+      
+      addMessage('user', text);
+      addTypingIndicator();
+      isWaitingForResponse = true;
+      
+      const payload = {
+        type: 'message',
+        content: text,
+        timestamp: new Date().toISOString()
+      };
+      
+      ws.send(JSON.stringify(payload));
+    }
+    
+    // ──────────────────────────────────────────────────────────────────────────────
+    // INPUT HANDLING
+    // ──────────────────────────────────────────────────────────────────────────────
+    
+    function autoResizeInput() {
+      messageInput.style.height = 'auto';
+      messageInput.style.height = Math.min(messageInput.scrollHeight, 120) + 'px';
+    }
+    
+    messageInput.addEventListener('input', autoResizeInput);
+    
+    messageInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const text = messageInput.value.trim();
+        if (text && isConnected && !isWaitingForResponse) {
+          sendMessage(text);
+        }
+      }
+    });
+    
+    btnSend.addEventListener('click', () => {
+      const text = messageInput.value.trim();
+      if (text && isConnected && !isWaitingForResponse) {
+        sendMessage(text);
+      }
+    });
+    
+    btnClear.addEventListener('click', async () => {
+      if (confirm('Clear all messages?')) {
+        messagesContainer.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">🤖</div>
+            <div class="empty-text">Welcome to JARVIS</div>
+            <div class="empty-subtext">Your AI Assistant is ready. Start a conversation!</div>
+          </div>
+        `;
+        
+        try {
+          await fetch(`${API_URL}/clear`, { method: 'POST' });
+        } catch (e) {
+          console.error('Failed to clear history:', e);
+        }
+      }
+    });
+    
+    btnSettings.addEventListener('click', () => {
+      alert('Settings coming soon!');
+    });
+    
+    // ──────────────────────────────────────────────────────────────────────────────
+    // INITIALIZATION
+    // ──────────────────────────────────────────────────────────────────────────────
+    
+    connectWebSocket();
+    
+    // Keep-alive ping every 30 seconds
+    setInterval(() => {
+      if (isConnected && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 30000);
+    
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      if (ws) ws.close();
+    });
+  </script>
+</body>
+</html>
