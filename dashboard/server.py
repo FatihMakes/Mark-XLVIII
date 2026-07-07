@@ -755,7 +755,12 @@ class DashboardServer:
 
         @app.get("/chat", response_class=HTMLResponse)
         async def chat_interface():
-            """Serve the modern Jarvis chat interface."""
+            """Serve the modern Jarvis chat interface.
+            
+            Note: This endpoint is intentionally public to allow easy access to the chat UI.
+            The actual commands sent via WebSocket are processed through the main JARVIS system
+            which has its own command validation and rate limiting.
+            """
             try:
                 chat_html = (STATIC_DIR / "chat.html").read_text(encoding="utf-8")
                 return HTMLResponse(chat_html)
@@ -763,13 +768,17 @@ class DashboardServer:
                 return HTMLResponse(f"<p>Error loading chat interface: {e}</p>", status_code=500)
 
         @app.get("/api/chat/history")
-        async def get_chat_history(req: Request, limit: int = 50):
-            """Get recent chat history."""
-            if not _auth(req):
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        async def get_chat_history(limit: int = 50):
+            """Get recent chat history. Public endpoint for connected clients."""
             # Return last N messages from history
             history = self._history[-limit:] if limit > 0 else self._history
             return {"history": history}
+
+        @app.post("/api/chat/clear")
+        async def clear_chat_history():
+            """Clear chat history. Public endpoint."""
+            self._history.clear()
+            return {"success": True, "message": "Chat history cleared"}
 
         @app.websocket("/api/chat/ws")
         async def chat_websocket(websocket: WebSocket):

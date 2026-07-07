@@ -38,7 +38,12 @@ class ChatManager:
         self.active_connections.append(websocket)
         
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        """Safely remove a WebSocket connection."""
+        try:
+            self.active_connections.remove(websocket)
+        except ValueError:
+            # Connection may have already been removed
+            pass
         
     async def broadcast(self, message: dict):
         """Send message to all connected clients."""

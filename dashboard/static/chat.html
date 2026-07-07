@@ -474,8 +474,11 @@
     // CONFIGURATION
     // ──────────────────────────────────────────────────────────────────────────────
     
-    const WS_URL = `ws://${window.location.host}/api/chat/ws`;
-    const API_URL = `http://${window.location.host}/api/chat`;
+    // Use protocol-relative URLs to support both HTTP and HTTPS
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const apiProtocol = window.location.protocol;
+    const WS_URL = `${protocol}//${window.location.host}/api/chat/ws`;
+    const API_URL = `${apiProtocol}//${window.location.host}/api/chat`;
     
     let ws = null;
     let isConnected = false;
@@ -600,8 +603,14 @@
       };
       
       ws.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        handleMessage(message);
+        try {
+          const message = JSON.parse(event.data);
+          handleMessage(message);
+        } catch (e) {
+          console.error('Failed to parse WebSocket message:', e);
+          // Log raw message for debugging
+          console.debug('Raw message:', event.data);
+        }
       };
       
       ws.onerror = (error) => {
@@ -634,9 +643,13 @@
             isWaitingForResponse = true;
           }
           removeTypingIndicator();
-          // Append to last message or create new one
-          const lastBubble = messagesContainer.querySelector('.message.assistant:last-child .message-bubble');
-          if (lastBubble) {
+          // Append to last message or create new one if no bubble exists
+          let lastBubble = messagesContainer.querySelector('.message.assistant:last-child .message-bubble');
+          if (!lastBubble) {
+            // Create a new assistant message if none exists (handles reconnect case)
+            addMessage('assistant', content);
+            lastBubble = messagesContainer.querySelector('.message.assistant:last-child .message-bubble');
+          } else {
             lastBubble.innerHTML += escapeHtml(content).replace(/\n/g, '<br>');
           }
           addTypingIndicator();
