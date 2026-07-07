@@ -11,6 +11,7 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import json
 import re
 import secrets
 import socket
@@ -747,6 +748,82 @@ class DashboardServer:
                 pass
             finally:
                 self._clients.discard(websocket)
+
+        # ──────────────────────────────────────────────────────────────────────
+        # JARVIS CHAT INTERFACE ROUTES
+        # ──────────────────────────────────────────────────────────────────────
+
+        @app.get("/chat", response_class=HTMLResponse)
+        async def chat_interface():
+            """Serve the modern Jarvis chat interface."""
+            try:
+                chat_html = (STATIC_DIR / "chat.html").read_text(encoding="utf-8")
+                return HTMLResponse(chat_html)
+            except Exception as e:
+                return HTMLResponse(f"<p>Error loading chat interface: {e}</p>", status_code=500)
+
+        @app.get("/api/chat/history")
+        async def get_chat_history(req: Request, limit: int = 50):
+            """Get recent chat history."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            # Return last N messages from history
+            history = self._history[-limit:] if limit > 0 else self._history
+            return {"history": history}
+
+        @app.websocket("/api/chat/ws")
+        async def chat_websocket(websocket: WebSocket):
+            """WebSocket endpoint for real-time chat interface."""
+            await websocket.accept()
+            chat_sessions = getattr(self, "_chat_sessions", {})
+            session_id = secrets.token_urlsafe(16)
+            chat_sessions[session_id] = {
+                "ws": websocket,
+                "created": time.time(),
+                "messages": [],
+            }
+
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    try:
+                        message = json.loads(data)
+                        msg_type = message.get("type", "message")
+
+                        if msg_type == "message":
+                            user_content = message.get("content", "").strip()
+                            if not user_content:
+                                continue
+
+                            # Add to command queue for main JARVIS system
+                            await self._command_queue.put(user_content)
+                            if self._wake_callback:
+                                self._wake_callback()
+
+                            # Track in session
+                            chat_sessions[session_id]["messages"].append({
+                                "role": "user",
+                                "content": user_content,
+                                "timestamp": time.time()
+                            })
+
+                            # Broadcast to dashboard for visibility
+                            await self.broadcast({
+                                "type": "chat_message",
+                                "role": "user",
+                                "text": user_content
+                            })
+
+                        elif msg_type == "ping":
+                            await websocket.send_json({"type": "pong"})
+
+                    except json.JSONDecodeError:
+                        pass
+
+            except WebSocketDisconnect:
+                pass
+            finally:
+                chat_sessions.pop(session_id, None)
 
         return app
 
