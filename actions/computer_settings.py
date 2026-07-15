@@ -206,7 +206,14 @@ def maximize_window():
 def snap_left():
     if _OS == "Windows":
         pyautogui.hotkey("win", "left")
-    elif _OS == "Linux":
+    elif _OS == "Darwin":
+        # macOS has no built-in snap; try Rectangle app shortcut if installed
+        try:
+            subprocess.run(["open", "-a", "Rectangle"], capture_output=True, timeout=1)
+        except Exception:
+            pass
+        pyautogui.hotkey("ctrl", "option", "left")
+    else:  # Linux
         try:
             subprocess.run(["wmctrl", "-r", ":ACTIVE:", "-e", "0,0,0,960,1080"],
                 capture_output=True)
@@ -216,7 +223,13 @@ def snap_left():
 def snap_right():
     if _OS == "Windows":
         pyautogui.hotkey("win", "right")
-    elif _OS == "Linux":
+    elif _OS == "Darwin":
+        try:
+            subprocess.run(["open", "-a", "Rectangle"], capture_output=True, timeout=1)
+        except Exception:
+            pass
+        pyautogui.hotkey("ctrl", "option", "right")
+    else:  # Linux
         try:
             subprocess.run(["wmctrl", "-r", ":ACTIVE:", "-e", "0,960,0,960,1080"],
                 capture_output=True)

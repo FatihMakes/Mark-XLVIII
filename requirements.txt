@@ -1,3 +1,4 @@
+PyQt6
 sounddevice
 google-genai
 google-generativeai
@@ -24,4 +25,5 @@ comtypes; sys_platform == "win32"
 pycaw; sys_platform == "win32"
 win10toast; sys_platform == "win32"
 pywinauto; sys_platform == "win32"
+pywin32; sys_platform == "win32"
 qrcode[pil]

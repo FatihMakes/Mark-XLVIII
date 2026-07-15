@@ -19,13 +19,12 @@ def _base_dir() -> Path:
 
 
 def _get_os() -> str:
-    try:
-        cfg = json.loads(
-            (_base_dir() / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
-        return cfg.get("os_system", "windows").lower()
-    except Exception:
-        return "windows"
+    _sys = platform.system()
+    if _sys == "Darwin":
+        return "mac"
+    if _sys == "Linux":
+        return "linux"
+    return "windows"
 
 
 def _scripts_dir() -> Path:

@@ -52,6 +52,8 @@ from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
+from actions.web_search        import _news as _fetch_news_sync
+from memory.config_manager     import get_brief_enabled
 
 
 def get_base_dir():
@@ -248,6 +250,9 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls any web browser. Use for: opening websites, searching the web, "
             "clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. "
+            "Simple open/search requests launch the user's own browser normally (their real profile "
+            "and logged-in accounts); interactive actions (click, type, fill_form...) attach an "
+            "automation browser. "
             "Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', "
             "'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously."
         ),
@@ -520,6 +525,7 @@ class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
+        self._asst_name     = "JARVIS"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
@@ -613,6 +619,15 @@ class JarvisLive:
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
+        # Load customization from config
+        try:
+            _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
+            self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
+            _user_name = (_cfg.get("user_name") or "").strip()
+        except Exception:
+            self._asst_name = "JARVIS"
+            _user_name = ""
+
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
@@ -625,7 +640,19 @@ class JarvisLive:
             f"Use this to calculate exact times for reminders.\n\n"
         )
 
-        parts = [time_ctx]
+        # Identity injection — overrides any hardcoded name in prompt.txt
+        _addr = (f"ADDRESS: Always call the user '{_user_name}'."
+                 if _user_name
+                 else "ADDRESS: When speaking Turkish → always say \"efendim\". "
+                      "When speaking English → say \"sir\". Never mix languages.")
+        identity_ctx = (
+            f"[IDENTITY]\n"
+            f"Your name is {self._asst_name}. "
+            f"Always refer to yourself as {self._asst_name}.\n"
+            f"{_addr}\n\n"
+        )
+
+        parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -725,9 +752,8 @@ class JarvisLive:
                     self._pending_vision = (img_b, mime_t, user_text, angle)
                     result = (
                         f"[VISION_ACTIVE] {_stall.capitalize()} captured. "
-                        f"Immediately say ONE natural sentence in the user's language "
-                        f"(e.g. 'Looking at your {_stall} now, sir' / "
-                        f"'{'Kameraya' if _stall == 'camera' else 'Ekrana'} bakıyorum efendim'). "
+                        f"Immediately say ONE short natural sentence in the user's own language, "
+                        f"telling them you are looking at their {_stall} right now. "
                         f"Do NOT describe or guess content — the actual image arrives in the NEXT message."
                     )
 
@@ -905,7 +931,7 @@ class JarvisLive:
 
                             full_out = " ".join(out_buf).strip()
                             if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
+                                self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -1003,15 +1029,13 @@ class JarvisLive:
 
     async def _send_startup_briefing(self) -> None:
         """
-        Two-phase briefing for instant perceived response:
-          Phase 1 — immediate greeting (no tools, no fetch) → Jarvis speaks in <2s
-          Phase 2 — news fetched in background, injected after greeting finishes
+        Two-phase briefing optimized for speed:
+          Phase 1 — instant greeting (no tools) → speech starts in <1s
+          Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
+                    delivered as ready text (no Gemini tool-call round-trip) and
+                    shown on the UI content panel. Waits for turn_complete event
+                    instead of a fixed sleep so there is no unnecessary gap.
         """
-        await asyncio.sleep(0.3)
-        if not self.session:
-            return
-
-        # ── memory ───────────────────────────────────────────────────────────
         memory   = load_memory()
         identity = memory.get("identity", {})
 
@@ -1021,17 +1045,27 @@ class JarvisLive:
 
         lang = _val("language")
         name = _val("name")
-
-        from datetime import datetime
         time_str = datetime.now().strftime("%H:%M")
 
-        # ── Phase 1: instant greeting — one simple sentence ──────────────────
+        # Start fetching news immediately — runs in parallel while phase 1 plays
+        loop = asyncio.get_event_loop()
+        news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
+
+        await asyncio.sleep(0.3)
+        if not self.session:
+            return
+
+        # ── Phase 1: instant greeting ─────────────────────────────────────────
         lang_clause = f" Respond in {lang}." if lang else ""
         name_clause = f" Address the user as {name}." if name else ""
         p1 = (
-            f"Greet the user, mention it is {time_str}, and say you are fetching today's news headlines now. "
+            f"Greet the user, mention it is {time_str}, and say you are fetching today's news now. "
             f"One short sentence only. Do not call any tools.{lang_clause}{name_clause}"
         )
+
+        # Clear the turn-done event so we can wait for Phase 1 to finish
+        if self._turn_done_event:
+            self._turn_done_event.clear()
 
         await self.session.send_client_content(
             turns={"parts": [{"text": p1}]},
@@ -1039,41 +1073,59 @@ class JarvisLive:
         )
         self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
 
-        # ── Phase 2: fetch news in background, deliver after greeting plays ───
-        async def _guarded_news():
+        # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
+        async def _deliver_news():
             try:
-                await self._briefing_news_phase(lang)
+                lang_str = f" Respond in {lang}." if lang else ""
+
+                # Wait for news fetch (already running) and Phase 1 turn-complete
+                # in parallel — whichever takes longer determines the wait time
+                news_done   = asyncio.wrap_future(news_future)
+                turn_waited = False
+                if self._turn_done_event:
+                    try:
+                        await asyncio.wait_for(self._turn_done_event.wait(), timeout=6.0)
+                        turn_waited = True
+                    except asyncio.TimeoutError:
+                        pass
+
+                # If turn_complete didn't fire (timeout), give a small buffer
+                if not turn_waited:
+                    await asyncio.sleep(1.0)
+
+                try:
+                    news_text = await asyncio.wait_for(news_done, timeout=4.0)
+                except Exception:
+                    news_text = ""
+
+                if not self.session:
+                    return
+
+                if news_text and len(news_text) > 60:
+                    # Show on UI content panel immediately
+                    self.ui.show_content("NEWS — top world news today", news_text)
+
+                    p2 = (
+                        f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
+                        "Pick ONE headline, summarise it in one sentence, then say the full list "
+                        f"is displayed on screen. Do not call any tools.{lang_str}"
+                    )
+                else:
+                    p2 = (
+                        "News headlines could not be fetched right now. "
+                        f"Let the user know briefly.{lang_str}"
+                    )
+
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": p2}]},
+                    turn_complete=True,
+                )
+                self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
             except Exception as e:
                 print(f"[Briefing] Phase 2 error: {e}")
-                self.ui.write_log(f"SYS: Briefing news phase failed: {e}")
-        asyncio.create_task(_guarded_news())
+                self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
 
-    async def _briefing_news_phase(self, lang: str) -> None:
-        """
-        Sends phase-2 (news) to Gemini ~1.5 s after phase-1 is dispatched so
-        Gemini starts working on it while phase-1 audio is still playing.
-        """
-        lang_str = f" Respond in {lang}." if lang else ""
-
-        # 1.5 s is enough for Gemini to finish generating phase-1 audio on its
-        # side (turn_complete) while the greeting is still being played locally.
-        await asyncio.sleep(1.5)
-
-        if not self.session:
-            return
-
-        p2 = (
-            "[BRIEFING] Call web_search with mode='news' and query='top world news today' "
-            "to find actual recent news articles with real event headlines (not just website names). "
-            "After the search, say ONE specific news event from the results in one sentence, "
-            f"then say the full list is displayed on screen.{lang_str}"
-        )
-
-        await self.session.send_client_content(
-            turns={"parts": [{"text": p2}]},
-            turn_complete=True,
-        )
-        self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
+        asyncio.create_task(_deliver_news())
 
     # ── System monitor ──────────────────────────────────────────────────────────
 
@@ -1242,8 +1294,8 @@ class JarvisLive:
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
-                    # Morning briefing — fires once per process launch
-                    if not self._briefing_sent:
+                    # Morning briefing — fires once per process launch (if enabled)
+                    if not self._briefing_sent and get_brief_enabled():
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 

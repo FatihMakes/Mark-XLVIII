@@ -34,7 +34,7 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "vscode":             {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
     "visual studio code": {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
     "code":               {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
-    "terminal":           {"Windows": "wt",                      "Darwin": "Terminal",             "Linux": "gnome-terminal"},
+    "terminal":           {"Windows": "wt",                      "Darwin": "Terminal",             "Linux": "x-terminal-emulator"},
     "cmd":                {"Windows": "cmd.exe",                 "Darwin": "Terminal",             "Linux": "bash"},
     "powershell":         {"Windows": "powershell.exe",          "Darwin": "Terminal",             "Linux": "bash"},
     "postman":            {"Windows": "Postman",                 "Darwin": "Postman",              "Linux": "postman"},
@@ -168,7 +168,23 @@ def _launch_macos(app_name: str) -> bool:
     return False
 
 
+_LINUX_TERMINAL_FALLBACKS = [
+    "x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal",
+    "xterm", "lxterminal", "mate-terminal", "tilix", "alacritty", "kitty",
+]
+
 def _launch_linux(app_name: str) -> bool:
+
+    # terminal emulators: try common ones in order
+    if app_name in ("x-terminal-emulator", "gnome-terminal", "terminal"):
+        for term in _LINUX_TERMINAL_FALLBACKS:
+            if shutil.which(term):
+                try:
+                    subprocess.Popen([term], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    time.sleep(1.0)
+                    return True
+                except Exception:
+                    continue
 
     binary = (
         shutil.which(app_name) or

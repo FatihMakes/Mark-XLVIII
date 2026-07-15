@@ -110,43 +110,53 @@ def _image_to_base64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("utf-8")
 
 
+_VALID_INTENTS = {"write", "edit", "explain", "run", "build", "screen_debug", "optimize"}
+
+
 def _detect_intent(description: str, file_path: str, code: str) -> str:
-    desc = (description or "").lower()
+    """
+    Dil bağımsız niyet tespiti — sabit anahtar kelime listesi YOK.
+    Kullanıcı hangi dilde konuşursa konuşsun, açıklama Gemini'ye
+    sınıflandırtılır. API'ye ulaşılamazsa dile bakmayan yapısal
+    ipuçlarına (dosya diskte var mı, kod verilmiş mi) düşülür.
+    """
+    desc        = (description or "").strip()
+    file_exists = bool(file_path) and Path(file_path).exists()
 
-    screen_kw = ["ekrandaki", "screen", "ekranda", "bu hatayı", "why am i getting",
-                 "neden hata", "what's wrong", "ne yanlış", "screenshot", "görüntü"]
-    if any(k in desc for k in screen_kw):
-        return "screen_debug"
+    if desc:
+        try:
+            ctx = []
+            if file_path:
+                ctx.append(f"a file path is provided (exists on disk: {file_exists})")
+            if code:
+                ctx.append("an inline code snippet is provided")
+            prompt = (
+                "Classify a coding assistant request into exactly ONE intent word.\n"
+                "The request may be written in ANY language.\n\n"
+                f"Request: {desc}\n"
+                + (f"Context: {'; '.join(ctx)}\n" if ctx else "")
+                + "\nIntents:\n"
+                "  write        = create new code from scratch\n"
+                "  edit         = modify an existing file\n"
+                "  explain      = describe what given code/file does\n"
+                "  run          = execute an existing file\n"
+                "  build        = write code, run it, and iterate until it works\n"
+                "  screen_debug = analyze an error currently visible on the user's screen\n"
+                "  optimize     = refactor / clean up / speed up existing code\n\n"
+                "Reply with ONLY the intent word, nothing else."
+            )
+            ans = _get_gemini().generate_content(prompt).text.strip().lower()
+            ans = ans.strip("`'\". \n")
+            if ans in _VALID_INTENTS:
+                return ans
+        except Exception as e:
+            print(f"[Code] Intent classification failed ({e}) — structural fallback")
 
-    optimize_kw = ["optimize", "refactor", "clean up", "improve", "temizle",
-                   "iyileştir", "daha iyi", "make it better", "hızlandır"]
-    if any(k in desc for k in optimize_kw) and (code or file_path):
-        return "optimize"
-
-    if file_path:
-        p = Path(file_path)
-        edit_kw  = ["edit", "update", "modify", "change", "add", "remove",
-                    "refactor", "fix", "rename", "replace", "düzenle", "değiştir"]
-        run_kw   = ["run", "execute", "launch", "start", "çalıştır"]
-        build_kw = ["build", "make it work", "try", "attempt"]
-
-        if p.exists() and any(k in desc for k in edit_kw):
-            return "edit"
-        if p.exists() and any(k in desc for k in run_kw):
-            return "run"
-        if any(k in desc for k in build_kw):
-            return "build"
-        if p.exists():
-            return "explain"
-
-    explain_kw = ["explain", "what does", "describe", "analyze", "açıkla", "ne yapıyor"]
-    if any(k in desc for k in explain_kw) and (code or file_path):
+    # Yapısal geri dönüş — hiçbir dile bağlı değil
+    if file_exists:
+        return "edit" if desc else "explain"
+    if code:
         return "explain"
-
-    build_kw = ["build", "make it work", "try and", "attempt"]
-    if any(k in desc for k in build_kw):
-        return "build"
-
     return "write"
 
 def _write(description: str, language: str, output_path: str, player=None) -> tuple[str, Path]:
